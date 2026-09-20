@@ -1,7 +1,9 @@
 import logging
 import os
 import requests
+import threading
 from io import BytesIO
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from PIL import Image, ImageDraw, ImageFont
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -30,10 +32,25 @@ class Onboarding(StatesGroup):
 
 users_data = {}
 
+# === "ДВЕРЬ-ПУСТЫШКА" ДЛЯ RENDER ===
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        pass
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+# ===================================
+
 def ask_qwen(prompt, max_tokens=4000):
     try:
         response = groq_client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
+            model="qwen/qwen3-32b",
             messages=[
                 {"role": "system", "content": "You are an elite SEO copywriter and business analyst. Answer in Russian."},
                 {"role": "user", "content": prompt}
@@ -44,7 +61,7 @@ def ask_qwen(prompt, max_tokens=4000):
         return response.choices[0].message.content
     except Exception as e:
         logging.error("Groq error: " + str(e))
-        return "Error with AI. Try later."
+        return "Ошибка при обращении к ИИ. Попробуйте позже."
 
 def generate_image(prompt):
     try:
@@ -84,10 +101,10 @@ def add_infographic(image_bytes, title, text):
 @dp.message(Command("start"))
 async def cmd_start(message, state: FSMContext):
     await message.answer(
-        "Привет! Я SEO-фабрика трафика.\n\n"
+        "👋 Привет! Я SEO-фабрика трафика.\n\n"
         "Я сам проанализирую твой бизнес, найду ключевые слова и боли ЦА, "
         "и буду писать готовые статьи с картинками.\n\n"
-        "Вопрос 1 из 5:\n"
+        "❓ Вопрос 1 из 5:\n"
         "Что именно ты продаешь? Опиши 2-3 словами."
     )
     await state.set_state(Onboarding.product)
@@ -95,32 +112,32 @@ async def cmd_start(message, state: FSMContext):
 @dp.message(Onboarding.product)
 async def get_product(message, state: FSMContext):
     users_data[message.from_user.id] = {"product": message.text}
-    await message.answer("Принял!\n\nВопрос 2 из 5:\nВ каком регионе работаешь?")
+    await message.answer("✅ Принял!\n\n❓ Вопрос 2 из 5:\nВ каком регионе работаешь?")
     await state.set_state(Onboarding.region)
 
 @dp.message(Onboarding.region)
 async def get_region(message, state: FSMContext):
     users_data[message.from_user.id]["region"] = message.text
-    await message.answer("Принял!\n\nВопрос 3 из 5:\nПришли ссылку на свой сайт (если нет - напиши нет).")
+    await message.answer("✅ Принял!\n\n❓ Вопрос 3 из 5:\nПришли ссылку на свой сайт (если нет - напиши нет).")
     await state.set_state(Onboarding.site)
 
 @dp.message(Onboarding.site)
 async def get_site(message, state: FSMContext):
     users_data[message.from_user.id]["site"] = message.text
-    await message.answer("Принял!\n\nВопрос 4 из 5:\nПришли ссылки на 3-5 конкурентов.")
+    await message.answer("✅ Принял!\n\n❓ Вопрос 4 из 5:\nПришли ссылки на 3-5 конкурентов.")
     await state.set_state(Onboarding.competitors)
 
 @dp.message(Onboarding.competitors)
 async def get_competitors(message, state: FSMContext):
     users_data[message.from_user.id]["competitors"] = message.text
-    await message.answer("Принял!\n\nВопрос 5 из 5:\nКакой ценовой сегмент? Напиши: эконом / средний / премиум.")
+    await message.answer("✅ Принял!\n\n❓ Вопрос 5 из 5:\nКакой ценовой сегмент? Напиши: эконом / средний / премиум.")
     await state.set_state(Onboarding.price)
 
 @dp.message(Onboarding.price)
 async def get_price(message, state: FSMContext):
     user_id = message.from_user.id
     users_data[user_id]["price"] = message.text
-    await message.answer("Анализирую нишу... 1-2 минуты.")
+    await message.answer("⏳ Анализирую нишу... 1-2 минуты.")
     data = users_data[user_id]
 
     analysis_text = "Продукт: " + data['product'] + "\n"
@@ -147,8 +164,8 @@ async def get_price(message, state: FSMContext):
 
     guide = ask_qwen(guide_text, max_tokens=1500)
 
-    final_msg = "АНАЛИЗ ГОТОВ!\n\n" + analysis + "\n\n---\n\n"
-    final_msg += "ИНСТРУКЦИЯ ПО ПУБЛИКАЦИИ:\n\n" + guide + "\n\n---\n\n"
+    final_msg = "🎯 АНАЛИЗ ГОТОВ!\n\n" + analysis + "\n\n---\n\n"
+    final_msg += "📚 ИНСТРУКЦИЯ ПО ПУБЛИКАЦИИ:\n\n" + guide + "\n\n---\n\n"
     final_msg += "Готов получить первую статью - напиши: /article"
 
     await message.answer(final_msg)
@@ -160,7 +177,7 @@ async def generate_article(message):
     if user_id not in users_data or "analysis" not in users_data[user_id]:
         await message.answer("Сначала пройди онбординг: /start")
         return
-    await message.answer("Пишу статью... 1-2 минуты.")
+    await message.answer("✍️ Пишу статью... 1-2 минуты.")
     data = users_data[user_id]
 
     article_text = "На основе анализа:\n" + data['analysis'] + "\n\n"
@@ -178,21 +195,23 @@ async def generate_article(message):
     article_text += "=== НУЖНЫЕ КАРТИНКИ ===\n"
 
     article = ask_qwen(article_text, max_tokens=4000)
-    await message.answer("СТАТЬЯ ГОТОВА:\n\n" + article)
+    await message.answer("📄 СТАТЬЯ ГОТОВА:\n\n" + article)
 
-    await message.answer("Генерирую обложку...")
+    await message.answer("🎨 Генерирую обложку...")
     img_prompt = "professional photo, " + data['product'] + ", high quality"
     image_bytes = generate_image(img_prompt)
     if image_bytes:
         photo = BufferedInputFile(image_bytes, filename="article_image.jpg")
-        await message.answer_photo(photo, caption="Обложка для статьи готова!")
+        await message.answer_photo(photo, caption="🖼 Обложка для статьи готова!")
     else:
-        await message.answer("Картинку сгенерировать не удалось, но статья готова.")
+        await message.answer("⚠️ Картинку сгенерировать не удалось, но статья готова.")
 
 async def main():
     logging.info("Bot started!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+    # Запускаем "дверь-пустышку" в отдельном потоке
+    threading.Thread(target=start_health_server, daemon=True).start()
     import asyncio
     asyncio.run(main())
