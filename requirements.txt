@@ -1,0 +1,4 @@
+aiogram==3.13.1
+openai==1.51.0
+requests==2.32.3
+Pillow==10.4.0
