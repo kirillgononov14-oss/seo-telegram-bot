@@ -2,6 +2,8 @@ import logging
 import os
 import requests
 import threading
+import time
+import asyncio
 from io import BytesIO
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from PIL import Image, ImageDraw, ImageFont
@@ -45,12 +47,12 @@ def start_health_server():
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     server.serve_forever()
 
-def ask_qwen(prompt, max_tokens=4000):
+def ask_qwen(prompt, max_tokens=900):
     try:
         response = groq_client.chat.completions.create(
             model="qwen/qwen3.8-27b",
             messages=[
-                {"role": "system", "content": "You are an elite SEO copywriter and business analyst. Answer in Russian language only."},
+                {"role": "system", "content": "You are an elite SEO copywriter and business analyst. Answer in Russian language only. Be concise and structured."},
                 {"role": "user", "content": prompt}
             ],
             max_tokens=max_tokens,
@@ -59,7 +61,7 @@ def ask_qwen(prompt, max_tokens=4000):
         return response.choices[0].message.content
     except Exception as e:
         logging.error("Groq error: " + str(e))
-        return "Ошибка при обращении к ИИ: " + str(e)[:100]
+        return "Ошибка: " + str(e)[:200]
 
 def generate_image(prompt):
     try:
@@ -72,29 +74,15 @@ def generate_image(prompt):
         logging.error("Image error: " + str(e))
         return None
 
-def add_infographic(image_bytes, title, text):
-    try:
-        img = Image.open(BytesIO(image_bytes)).convert("RGBA")
-        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        overlay_draw = ImageDraw.Draw(overlay)
-        overlay_draw.rectangle([(20, 20), (img.width - 20, 180)], fill=(0, 0, 0, 180))
-        img = Image.alpha_composite(img, overlay)
-        draw = ImageDraw.Draw(img)
-        try:
-            font_title = ImageFont.truetype("DejaVuSans.ttf", 40)
-            font_text = ImageFont.truetype("DejaVuSans.ttf", 24)
-        except Exception:
-            font_title = ImageFont.load_default()
-            font_text = ImageFont.load_default()
-        draw.text((40, 40), title, fill="white", font=font_title)
-        draw.text((40, 100), text, fill="white", font=font_text)
-        output = BytesIO()
-        img.convert("RGB").save(output, format="JPEG")
-        output.seek(0)
-        return output.getvalue()
-    except Exception as e:
-        logging.error("Infographic error: " + str(e))
-        return image_bytes
+async def send_long_message(message, text):
+    MAX_LEN = 4000
+    if len(text) <= MAX_LEN:
+        await message.answer(text)
+    else:
+        parts = [text[i:i+MAX_LEN] for i in range(0, len(text), MAX_LEN)]
+        for part in parts:
+            await message.answer(part)
+            await asyncio.sleep(0.5)
 
 @dp.message(Command("start"))
 async def cmd_start(message, state: FSMContext):
@@ -135,38 +123,37 @@ async def get_competitors(message, state: FSMContext):
 async def get_price(message, state: FSMContext):
     user_id = message.from_user.id
     users_data[user_id]["price"] = message.text
-    await message.answer("⏳ Анализирую нишу... 1-2 минуты.")
+    await message.answer("⏳ Анализирую нишу... Это займет 1-2 минуты.")
     data = users_data[user_id]
 
     analysis_text = "Продукт: " + data['product'] + "\n"
     analysis_text += "Регион: " + data['region'] + "\n"
     analysis_text += "Конкуренты: " + data['competitors'] + "\n"
     analysis_text += "Сегмент: " + data['price'] + "\n\n"
-    analysis_text += "Сделай:\n"
-    analysis_text += "1. 30 ключевых запросов для ниши\n"
-    analysis_text += "2. 15 главных болей ЦА\n"
-    analysis_text += "3. УТП\n"
-    analysis_text += "4. Контент-план на 2 недели (1 статья в день)\n\n"
+    analysis_text += "Сделай кратко:\n"
+    analysis_text += "1. 15 ключевых запросов (самые важные)\n"
+    analysis_text += "2. 10 главных болей ЦА\n"
+    analysis_text += "3. Короткое УТП (2-3 предложения)\n"
+    analysis_text += "4. Контент-план на 7 дней\n\n"
     analysis_text += "Оформи так:\n"
     analysis_text += "=== КЛЮЧИ ===\n"
     analysis_text += "=== БОЛИ ЦА ===\n"
     analysis_text += "=== УТП ===\n"
     analysis_text += "=== КОНТЕНТ-ПЛАН ===\n"
 
-    analysis = ask_qwen(analysis_text, max_tokens=3000)
+    analysis = ask_qwen(analysis_text, max_tokens=900)
     users_data[user_id]["analysis"] = analysis
+    
+    await asyncio.sleep(1)
 
-    guide_text = "Напиши пошаговую инструкцию для чайника: как опубликовать SEO-статью на сайте. "
-    guide_text += "7 простых шагов: создать страницу, вставить текст, прописать Title и Description, "
-    guide_text += "добавить картинку с alt-тегом, когда публиковать. Без терминов."
+    guide_text = "Напиши КРАТКУЮ пошаговую инструкцию для чайника: как опубликовать SEO-статью на сайте. "
+    guide_text += "5 простых шагов без терминов."
 
-    guide = ask_qwen(guide_text, max_tokens=1500)
+    guide = ask_qwen(guide_text, max_tokens=500)
 
-    final_msg = "🎯 АНАЛИЗ ГОТОВ!\n\n" + analysis + "\n\n---\n\n"
-    final_msg += "📚 ИНСТРУКЦИЯ ПО ПУБЛИКАЦИИ:\n\n" + guide + "\n\n---\n\n"
-    final_msg += "Готов получить первую статью - напиши: /article"
-
-    await message.answer(final_msg)
+    await send_long_message(message, "🎯 АНАЛИЗ ГОТОВ!\n\n" + analysis)
+    await send_long_message(message, "📚 ИНСТРУКЦИЯ ПО ПУБЛИКАЦИИ:\n\n" + guide)
+    await message.answer("Готов получить первую статью - напиши: /article")
     await state.clear()
 
 @dp.message(Command("article"))
@@ -179,30 +166,30 @@ async def generate_article(message):
     data = users_data[user_id]
 
     article_text = "На основе анализа:\n" + data['analysis'] + "\n\n"
-    article_text += "Напиши первую SEO-статью:\n"
+    article_text += "Напиши SEO-статью:\n"
     article_text += "1. H1 с ключом\n"
     article_text += "2. Вступление с болью ЦА\n"
     article_text += "3. H2, H3, списки\n"
-    article_text += "4. 2500-3000 слов\n"
-    article_text += "5. В конце нативный призыв (без купи)\n"
-    article_text += "6. Title (до 60 символов) и Description (до 160 символов)\n\n"
+    article_text += "4. 1500-2000 слов\n"
+    article_text += "5. В конце нативный призыв\n"
+    article_text += "6. Title (до 60 симв) и Description (до 160 симв)\n\n"
     article_text += "Оформи:\n"
     article_text += "=== TITLE ===\n"
     article_text += "=== DESCRIPTION ===\n"
     article_text += "=== СТАТЬЯ ===\n"
-    article_text += "=== НУЖНЫЕ КАРТИНКИ ===\n"
 
-    article = ask_qwen(article_text, max_tokens=4000)
-    await message.answer("📄 СТАТЬЯ ГОТОВА:\n\n" + article)
+    article = ask_qwen(article_text, max_tokens=900)
+    
+    await send_long_message(message, "📄 СТАТЬЯ ГОТОВА:\n\n" + article)
 
     await message.answer("🎨 Генерирую обложку...")
     img_prompt = "professional photo, " + data['product'] + ", high quality"
     image_bytes = generate_image(img_prompt)
     if image_bytes:
         photo = BufferedInputFile(image_bytes, filename="article_image.jpg")
-        await message.answer_photo(photo, caption="🖼 Обложка для статьи готова!")
+        await message.answer_photo(photo, caption="🖼 Обложка готова!")
     else:
-        await message.answer("⚠️ Картинку сгенерировать не удалось, но статья готова.")
+        await message.answer("⚠️ Картинку не сгенерировал, но статья готова.")
 
 async def main():
     logging.info("Bot started!")
