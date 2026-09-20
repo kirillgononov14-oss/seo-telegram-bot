@@ -32,7 +32,6 @@ class Onboarding(StatesGroup):
 
 users_data = {}
 
-# === "ДВЕРЬ-ПУСТЫШКА" ДЛЯ RENDER ===
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -45,14 +44,13 @@ def start_health_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     server.serve_forever()
-# ===================================
 
 def ask_qwen(prompt, max_tokens=4000):
     try:
         response = groq_client.chat.completions.create(
-            model="qwen/qwen3-32b",
+            model="qwen/qwen3.8-27b",
             messages=[
-                {"role": "system", "content": "You are an elite SEO copywriter and business analyst. Answer in Russian."},
+                {"role": "system", "content": "You are an elite SEO copywriter and business analyst. Answer in Russian language only."},
                 {"role": "user", "content": prompt}
             ],
             max_tokens=max_tokens,
@@ -61,7 +59,7 @@ def ask_qwen(prompt, max_tokens=4000):
         return response.choices[0].message.content
     except Exception as e:
         logging.error("Groq error: " + str(e))
-        return "Ошибка при обращении к ИИ. Попробуйте позже."
+        return "Ошибка при обращении к ИИ: " + str(e)[:100]
 
 def generate_image(prompt):
     try:
@@ -211,7 +209,6 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    # Запускаем "дверь-пустышку" в отдельном потоке
     threading.Thread(target=start_health_server, daemon=True).start()
     import asyncio
     asyncio.run(main())
