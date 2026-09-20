@@ -1,4 +1,5 @@
 import logging
+import os
 import requests
 from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont
@@ -10,9 +11,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BufferedInputFile
 from openai import OpenAI
 
-# === НАСТРОЙКИ (сюда вставь свои ключи) ===
-BOT_TOKEN = "ВСТАВЬ_СЮДА_ТОКЕН_ОТ_BOTFATHER"
-GROQ_API_KEY = "ВСТАВЬ_СЮДА_КЛЮЧ_GROQ"
+# === КЛЮЧИ БЕРУТСЯ ИЗ БЕЗОПАСНОГО МЕСТА (Render) ===
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 # === ЛОГИ ===
 logging.basicConfig(level=logging.INFO)
@@ -38,7 +39,7 @@ users_data = {}
 def ask_qwen(prompt: str, max_tokens: int = 4000) -> str:
     try:
         response = groq_client.chat.completions.create(
-            model="qwen/qwen3-8b",
+            model="qwen/qwen3.8-27b",
             messages=[
                 {"role": "system", "content": "Ты — элитный SEO-копирайтер и бизнес-аналитик. Отвечай на русском языке."},
                 {"role": "user", "content": prompt}
@@ -196,25 +197,4 @@ async def generate_article(message: types.Message):
 Оформи:
 === TITLE ===
 === DESCRIPTION ===
-=== СТАТЬЯ ===
-=== НУЖНЫЕ КАРТИНКИ ===
-"""
-    article = ask_qwen(article_prompt, max_tokens=4000)
-    await message.answer(f"📄 СТАТЬЯ ГОТОВА:\n\n{article}")
-
-    await message.answer("🎨 Генерирую обложку...")
-    image_bytes = generate_image(f"professional photo, {data['product']}, high quality")
-    if image_bytes:
-        photo = BufferedInputFile(image_bytes, filename="article_image.jpg")
-        await message.answer_photo(photo, caption="🖼 Обложка для статьи готова!")
-    else:
-        await message.answer("⚠️ Картинку сгенерировать не удалось, но статья готова.")
-
-# === ЗАПУСК ===
-async def main():
-    logging.info("Бот запущен!")
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+=== СТАТЬЯ
