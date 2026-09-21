@@ -229,7 +229,7 @@ def ask_qwen(prompt, max_tokens=900, system=None):
     sys_msg = system or SYSTEM_PROMPT
     try:
         response = groq_client.chat.completions.create(
-            model="qwen/qwen3-32b",
+            model="qwen/qwen3.8-27b",
             messages=[
                 {"role": "system", "content": sys_msg},
                 {"role": "user", "content": prompt}
