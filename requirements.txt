@@ -2,3 +2,7 @@ aiogram
 openai
 requests
 Pillow
+supabase
+pytrends
+beautifulsoup4
+lxml
