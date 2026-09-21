@@ -3,6 +3,6 @@ openai
 requests
 Pillow
 supabase
-pytrends
 beautifulsoup4
 lxml
+duckduckgo-search
