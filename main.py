@@ -22,7 +22,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")
-ADMIN_ID = 123456789  # Замени на свой Telegram ID (получим позже)
+ADMIN_ID = 1847007101  # Замени на свой Telegram ID (получим позже)
 
 logging.basicConfig(level=logging.INFO)
 
