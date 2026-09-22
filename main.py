@@ -13,10 +13,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton,
 )
 from openai import OpenAI
 from supabase import create_client, Client
@@ -41,11 +39,18 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 BANNED_NICHES = ["обнал", "отмыв", "адалт", "18+", "порн", "оружие", "наркот", "взлом", "хакер"]
 
-SYSTEM_PROMPT = """Ты — элитный SEO-стратег и контент-маркетолог с 15-летним опытом.
-Работаешь как настоящий живой маркетолог на брифе.
+# Несколько User-Agent для маскировки под разные браузеры
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+]
 
+SYSTEM_PROMPT = """Ты — элитный SEO-стратег и контент-маркетолог с 15-летним опытом.
 ПРИНЦИПЫ:
-1. Живое интервью: по одному вопросу, внимательно читай ответы, не шаблонься
+1. Живое интервью: по одному вопросу, внимательно читай ответы
 2. Несколько услуг = разные ниши. Спроси приоритет
 3. Анализируй ТОЛЬКО реальные данные. Не выдумывай
 4. Статья = 1 ключ + 1 боль. Язык читателя, решай боль
@@ -68,9 +73,9 @@ class ErrorHandlerMiddleware(BaseMiddleware):
             logger.error(f"❌ ОШИБКА: {type(e).__name__}: {e}", exc_info=True)
             try:
                 if hasattr(event, 'message') and event.message:
-                    await event.message.answer(f"⚠️ Ошибка. Напиши /start\n{str(e)[:100]}")
+                    await event.message.answer(f"⚠️ Ошибка. /start\n{str(e)[:100]}")
                 elif hasattr(event, 'callback_query') and event.callback_query:
-                    await event.callback_query.message.answer("⚠️ Ошибка. Напиши /start")
+                    await event.callback_query.message.answer("⚠️ Ошибка. /start")
             except Exception:
                 pass
             return None
@@ -121,81 +126,173 @@ def parse_source(url):
     else:
         return extract_site_text(url), "Сайт"
 
-# === ПАРСЕРЫ ===
+# === УЛУЧШЕННЫЕ ПАРСЕРЫ ===
+def _request_with_retry(url, timeout=45, is_mobile=False):
+    """Делает несколько попыток с разными User-Agent"""
+    for i, ua in enumerate(USER_AGENTS[:3]):  # 3 попытки
+        try:
+            headers = {
+                "User-Agent": ua,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5",
+                "Accept-Encoding": "gzip, deflate",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Cache-Control": "max-age=0"
+            }
+            r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+            r.encoding = "utf-8"
+            if r.status_code == 200:
+                logger.info(f"✅ HTTP 200 на попытке {i+1} для {url}")
+                return r
+            logger.warning(f"⚠️ Status {r.status_code} для {url}, попытка {i+1}")
+        except requests.exceptions.Timeout:
+            logger.warning(f"⏱️ Таймаут на попытке {i+1} для {url}")
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка на попытке {i+1}: {type(e).__name__}")
+        time.sleep(1)  # Пауза перед следующей попыткой
+    return None
+
 def extract_site_text(url):
     try:
         if not url.startswith("http"):
             url = "https://" + url
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        r = requests.get(url, headers=headers, timeout=30)
-        r.encoding = "utf-8"
+        
+        # Пробуем с www и без
+        r = _request_with_retry(url, timeout=45)
+        if not r:
+            # Пробуем альтернативный вариант
+            alt_url = url.replace("https://", "http://") if url.startswith("https://") else url.replace("http://", "https://")
+            r = _request_with_retry(alt_url, timeout=45)
+        
+        if not r:
+            return None
+        
         soup = BeautifulSoup(r.text, "lxml")
-        for s in soup(["script", "style", "nav", "footer", "header"]):
+        for s in soup(["script", "style", "nav", "footer", "header", "noscript"]):
             s.decompose()
         text = soup.get_text(separator="\n", strip=True)
-        logger.info(f"✅ Site parsed: {len(text)} chars")
-        return text[:5000]
+        logger.info(f"✅ Site: {len(text)} chars from {url}")
+        return text[:5000] if len(text) > 100 else None
     except Exception as e:
-        logger.error(f"❌ Site error: {e}")
+        logger.error(f"❌ Site error {url}: {e}")
         return None
 
 def extract_telegram_channel(url):
     try:
         ch = url.replace("https://t.me/", "").replace("t.me/", "").strip("/").split("/")[0]
-        r = requests.get(f"https://t.me/s/{ch}", headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
-        r.encoding = "utf-8"
+        public_url = f"https://t.me/s/{ch}"
+        r = _request_with_retry(public_url, timeout=30)
+        if not r:
+            return None
         soup = BeautifulSoup(r.text, "lxml")
         posts = [p.get_text(strip=True) for p in soup.find_all("div", class_="tgme_widget_message_text") if p.get_text(strip=True)]
         if not posts:
             return None
-        logger.info(f"✅ TG parsed: {len(posts)} posts")
+        logger.info(f"✅ TG: {len(posts)} posts")
         return "\n\n".join(posts[:10])[:5000]
     except Exception as e:
         logger.error(f"❌ TG error: {e}")
         return None
 
 def extract_avito(url):
+    """Парсит Авито разными способами"""
     try:
         if not url.startswith("http"):
             url = "https://" + url
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Accept-Language": "ru-RU"}
-        r = requests.get(url, headers=headers, timeout=20)
-        r.encoding = "utf-8"
-        if r.status_code != 200:
-            return None
-        soup = BeautifulSoup(r.text, "lxml")
-        text = soup.get_text(separator="\n", strip=True)
-        if len(text) < 200:
-            return None
-        logger.info(f"✅ Avito parsed: {len(text)} chars")
-        return text[:5000]
+        
+        # Способ 1: обычная версия
+        r = _request_with_retry(url, timeout=45)
+        if r:
+            soup = BeautifulSoup(r.text, "lxml")
+            # Ищем описание объявления
+            description = ""
+            for tag in soup.find_all(["div", "p", "span"]):
+                text = tag.get_text(strip=True)
+                if len(text) > 30 and any(c in text for c in ["руб", "₽", "дом", "м²", "участок"]):
+                    description += text + "\n"
+            
+            if len(description) > 200:
+                logger.info(f"✅ Avito: {len(description)} chars (v1)")
+                return description[:5000]
+        
+        # Способ 2: мобильная версия
+        mobile_url = url.replace("www.avito.ru", "m.avito.ru")
+        r = _request_with_retry(mobile_url, timeout=45)
+        if r:
+            soup = BeautifulSoup(r.text, "lxml")
+            text = soup.get_text(separator="\n", strip=True)
+            if len(text) > 300:
+                logger.info(f"✅ Avito mobile: {len(text)} chars")
+                return text[:5000]
+        
+        # Способ 3: ищем через JSON в HTML
+        if r:
+            text = r.text
+            # Авито иногда вставляет данные в JSON
+            if "description" in text.lower() and len(text) > 1000:
+                logger.info(f"✅ Avito via page analysis")
+                soup = BeautifulSoup(text, "lxml")
+                clean_text = soup.get_text(separator="\n", strip=True)
+                if len(clean_text) > 200:
+                    return clean_text[:5000]
+        
+        return None
     except Exception as e:
         logger.error(f"❌ Avito error: {e}")
         return None
 
 def extract_vk_group(url):
+    """Парсит ВКонтакте"""
     try:
-        vk = url.replace("https://vk.com/", "").replace("https://vk.ru/", "").replace("vk.com/", "").replace("vk.ru/", "").strip("/").split("/")[0]
-        r = requests.get(f"https://m.vk.com/{vk}", headers={"User-Agent": "Mozilla/5.0 (iPhone)"}, timeout=20)
-        r.encoding = "utf-8"
-        if r.status_code != 200:
-            return None
-        soup = BeautifulSoup(r.text, "lxml")
-        posts = [p.get_text(strip=True) for p in soup.find_all("div", class_="wall_post_text") if len(p.get_text(strip=True)) > 20]
-        if not posts:
-            posts = [p.get_text(strip=True) for p in soup.find_all("div", class_="Post__copy") if len(p.get_text(strip=True)) > 20]
-        desc = ""
-        for d in soup.find_all(["div", "p"], class_=["group_info", "page_info", "group_description"]):
-            desc += d.get_text(strip=True) + "\n"
-        if not posts and not desc:
-            return None
-        result = ""
-        if desc:
-            result += "ОПИСАНИЕ:\n" + desc + "\n\n"
-        if posts:
-            result += "ПОСТЫ:\n" + "\n---\n".join(posts[:10])
-        logger.info(f"✅ VK parsed: {len(result)} chars")
-        return result[:5000]
+        vk = url.replace("https://vk.com/", "").replace("https://vk.ru/", "")
+        vk = vk.replace("vk.com/", "").replace("vk.ru/", "").strip("/").split("/")[0]
+        
+        # Способ 1: мобильная версия (легче парсится)
+        mobile_url = f"https://m.vk.com/{vk}"
+        r = _request_with_retry(mobile_url, timeout=45)
+        if r:
+            soup = BeautifulSoup(r.text, "lxml")
+            posts = []
+            for p in soup.find_all(["div", "p"]):
+                text = p.get_text(strip=True)
+                if len(text) > 30 and len(text) < 1000:
+                    posts.append(text)
+            
+            if posts:
+                # Берём уникальные
+                unique_posts = []
+                seen = set()
+                for p in posts:
+                    if p not in seen:
+                        seen.add(p)
+                        unique_posts.append(p)
+                posts = unique_posts[:15]
+            
+            desc = ""
+            for d in soup.find_all(["div", "p"], class_=["group_info", "page_info", "group_description", "info"]):
+                desc += d.get_text(strip=True) + "\n"
+            
+            if posts or desc:
+                result = ""
+                if desc:
+                    result += "ОПИСАНИЕ:\n" + desc + "\n\n"
+                if posts:
+                    result += "ПОСТЫ:\n" + "\n---\n".join(posts[:10])
+                logger.info(f"✅ VK mobile: {len(result)} chars, {len(posts)} posts")
+                return result[:5000]
+        
+        # Способ 2: публичная страница
+        public_url = f"https://vk.com/{vk}"
+        r = _request_with_retry(public_url, timeout=45)
+        if r:
+            soup = BeautifulSoup(r.text, "lxml")
+            text = soup.get_text(separator="\n", strip=True)
+            if len(text) > 500:
+                logger.info(f"✅ VK public: {len(text)} chars")
+                return text[:5000]
+        
+        return None
     except Exception as e:
         logger.error(f"❌ VK error: {e}")
         return None
@@ -211,7 +308,9 @@ def search_competitors(q, max_results=5):
 
 def get_yandex_suggestions(kw):
     try:
-        r = requests.get("https://suggest.yandex.net/suggest-ff.cgi", params={"part": kw, "lang": "ru", "v": "3"}, timeout=10)
+        r = requests.get("https://suggest.yandex.net/suggest-ff.cgi",
+                         params={"part": kw, "lang": "ru", "v": "3"},
+                         headers={"User-Agent": USER_AGENTS[0]}, timeout=10)
         data = r.json()
         return data[1] if isinstance(data, list) and len(data) > 1 else []
     except Exception as e:
@@ -305,7 +404,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
     await message.answer(
         "👋 **Привет! Я — твой SEO-стратег.**\n\n"
-        "Проведу интервью, изучу нишу и буду писать статьи для **Дзена, Яндекса и Гугла**.\n"
+        "Проведу интервью, изучу нишу и буду писать статьи.\n"
         "⏱ 5-7 минут.\n\n"
         "❓ **Вопрос 1:**\nЧто продаёшь? Опиши в 2-3 предложениях.",
         parse_mode="Markdown"
@@ -315,7 +414,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 @dp.message(Command("ping"))
 async def cmd_ping(message: types.Message):
-    await message.answer(f"✅ Бот жив! Время: {int(time.time())}")
+    await message.answer(f"✅ Бот жив! {int(time.time())}")
 
 # === ИНТЕРВЬЮ ===
 @dp.message(Onboarding.gathering)
@@ -328,7 +427,7 @@ async def live_interview(message: types.Message, state: FSMContext):
     src_req = data.get("source_requested", False)
 
     if qn == 1 and is_banned(message.text):
-        await message.answer("❌ Не работаю с этой темой. /start чтобы начать заново.")
+        await message.answer("❌ Не работаю с этой темой. /start")
         await state.clear()
         return
 
@@ -354,9 +453,9 @@ async def live_interview(message: types.Message, state: FSMContext):
         await state.update_data(history=history, question_num=qn + 1, source_requested=True)
         await message.answer(
             "✅ **Уже многое понял!**\n\n"
-            "🔗 Пришли ссылки на источники (можно несколько через пробел):\n"
+            "🔗 Пришли ссылки на источники (можно несколько):\n"
             "• 🌐 Сайт\n• ✈️ Telegram-канал\n• 📱 Авито\n• 💬 ВКонтакте\n\n"
-            "Изучу каждый сам. Нет источника — напиши **«нет»**.",
+            "Изучу каждый. Нет источника — напиши **«нет»**.",
             parse_mode="Markdown"
         )
         await state.set_state(Onboarding.source_link)
@@ -377,7 +476,6 @@ async def live_interview(message: types.Message, state: FSMContext):
     await state.update_data(history=history, question_num=qn + 1)
     await message.answer(f"❓ **Вопрос {qn + 1}:**\n{nq}", parse_mode="Markdown")
 
-# === ВЫБОР УСЛУГИ ===
 @dp.callback_query(F.data.startswith("svc_"))
 async def service_chosen(callback: types.CallbackQuery, state: FSMContext):
     idx = int(callback.data.replace("svc_", ""))
@@ -390,12 +488,12 @@ async def service_chosen(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(priority_service=pri, history=history, question_num=2)
     await state.set_state(Onboarding.gathering)
     ht = "\n".join([f"Q{i['q']}: {i['a']}" for i in history])
-    nq = ask_qwen(f"Клиент выбрал: {pri}\nБизнес: {ht}\nЗадай вопрос о страхах клиентов. ТОЛЬКО вопрос.", max_tokens=200)
+    nq = ask_qwen(f"Клиент выбрал: {pri}\nБизнес: {ht}\nВопрос о страхах. ТОЛЬКО вопрос.", max_tokens=200)
     if not nq.startswith("⚠️"):
         await callback.message.answer(f"❓ **Вопрос 2:**\n{nq}", parse_mode="Markdown")
     await callback.answer()
 
-# === ИСТОЧНИКИ (НЕСКОЛЬКО) ===
+# === ИСТОЧНИКИ ===
 @dp.message(Onboarding.source_link)
 async def get_source(message: types.Message, state: FSMContext):
     uid = message.from_user.id
@@ -409,9 +507,7 @@ async def get_source(message: types.Message, state: FSMContext):
         save_answer(uid, "source_data", src[:2000])
         ht = "\n".join([f"Q{i['q']}: {i['a']}" for i in history])
         pri = data.get("priority_service", "")
-        analysis = ask_qwen(f"""Клиент прислал:
-{src}
-
+        analysis = ask_qwen(f"""Клиент прислал: {src}
 Интервью: {ht}
 Приоритет: {pri or 'не указан'}
 
@@ -444,7 +540,7 @@ async def get_source(message: types.Message, state: FSMContext):
         else:
             urls = [answer]
 
-    await message.answer(f"⏳ **Нашёл {len(urls)} источник(ов). Изучаю каждый...**", parse_mode="Markdown")
+    await message.answer(f"⏳ **Нашёл {len(urls)} источник(ов). Изучаю каждый (это может занять 30-60 сек)...**", parse_mode="Markdown")
 
     all_data = ""
     results = []
@@ -455,7 +551,7 @@ async def get_source(message: types.Message, state: FSMContext):
             results.append(f"✅ **{src_type}** — изучен!")
             all_data += f"\n=== {src_type}: {url} ===\n{src_text}\n"
         else:
-            results.append(f"⚠️ **{src_type}** ({url}) — не открылся")
+            results.append(f"⚠️ **{src_type}** ({url}) — не открылся (сайт блокирует зарубежные серверы)")
 
     results_text = "\n".join(results)
 
@@ -469,7 +565,7 @@ async def get_source(message: types.Message, state: FSMContext):
 Интервью: {ht}
 Приоритет: {pri or 'не указан'}
 
-Проанализируй ЧЕСТНО (только на основе данных):
+Проанализируй ЧЕСТНО:
 📌 Сильные стороны (3-4)
 📌 Слабые места (2-3)
 📌 Стиль общения
@@ -481,7 +577,18 @@ async def get_source(message: types.Message, state: FSMContext):
             await send_long(message, f"📊 **Результаты:**\n{results_text}\n\n{analysis}")
         await state.update_data(history=history, question_num=data.get("question_num", 4), source_requested=True, source_data=all_data[:3000], waiting_manual=False)
     else:
-        await message.answer(f"📊 **Результаты:**\n{results_text}\n\nНе смог открыть. Пришли **текстом**: описание, цены, услуги.", parse_mode="Markdown")
+        # Ни один не открылся — честно объясняем причину и просим текст
+        await message.answer(
+            f"📊 **Результаты изучения:**\n{results_text}\n\n"
+            f"⚠️ **Почему так:** мой сервер находится в Германии, "
+            f"а многие российские сайты (Авито, ВК, некоторые сайты) "
+            f"блокируют зарубежные запросы или отвечают слишком медленно.\n\n"
+            f"💡 **Что делать:** просто **скопируй текст** со своих источников "
+            f"(описание, цены, услуги) и пришли мне одним сообщением — "
+            f"я его изучу и сделаю такой же качественный анализ.\n\n"
+            f"Это займёт 1 минуту, и результат будет не хуже.",
+            parse_mode="Markdown"
+        )
         await state.update_data(waiting_manual=True)
         return
 
@@ -538,7 +645,7 @@ async def finish_interview(message, state, history):
 Контент-план на 7 дней для Дзен. 1 статья = 1 ключ + 1 боль. День + ЧАС.
 === 📅 ПЛАН ===""", max_tokens=900)
 
-    guide = ask_qwen("""Инструкция чайнику: публикация в Дзен. 5 шагов. Аналогия с магазином. Эмодзи + жирный.""", max_tokens=800)
+    guide = ask_qwen("""Инструкция чайнику: публикация в Дзен. 5 шагов. Аналогия с магазином.""", max_tokens=800)
 
     save_research(uid, analysis + "\n\n" + plan, "", "", comp_text)
 
