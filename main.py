@@ -7,7 +7,7 @@ import time
 import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -31,11 +31,16 @@ ADMIN_ID = 1847007101
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
-groq_client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+try:
+    bot = Bot(token=BOT_TOKEN)
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
+    groq_client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    logger.info("✅ All services initialized")
+except Exception as e:
+    logger.error(f"❌ INIT ERROR: {e}")
+    raise
 
 BANNED_NICHES = ["обнал", "отмыв", "адалт", "18+", "порн", "оружие", "наркот", "взлом", "хакер"]
 
@@ -61,7 +66,7 @@ QUESTION_SYSTEM = BASE_SYSTEM + """
 - Без нумерации, без эмодзи
 - Максимум 150 слов"""
 
-# === ГЛАВНОЕ МЕНЮ (постоянная клавиатура) ===
+# === ГЛАВНОЕ МЕНЮ ===
 def get_main_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -93,15 +98,16 @@ class ErrorHandlerMiddleware(BaseMiddleware):
         except Exception as e:
             logger.error(f"❌ MIDDLEWARE ERROR: {type(e).__name__}: {e}", exc_info=True)
             try:
+                msg = None
                 if hasattr(event, 'message') and event.message:
-                    await event.message.answer(
-                        f"⚠️ Что-то пошло не так.\nНажми **▶️ Продолжить** в меню ниже.",
-                        parse_mode="Markdown"
-                    )
+                    msg = event.message
                 elif hasattr(event, 'callback_query') and event.callback_query:
-                    await event.callback_query.message.answer(
-                        f"⚠️ Что-то пошло не так.\nНажми **▶️ Продолжить** в меню ниже.",
-                        parse_mode="Markdown"
+                    msg = event.callback_query.message
+                if msg:
+                    await msg.answer(
+                        f"⚠️ Что-то пошло не так. Нажми **▶️ Продолжить** в меню.",
+                        parse_mode="Markdown",
+                        reply_markup=get_main_menu()
                     )
             except Exception:
                 pass
@@ -148,8 +154,7 @@ def scrape_with_api(url, premium=False, render=False, country_code="ru"):
 
 def scrape_google_cache(url):
     try:
-        cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{url}"
-        r = requests.get(cache_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        r = requests.get(f"https://webcache.googleusercontent.com/search?q=cache:{url}", headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
         return r.text if r.status_code == 200 and len(r.text) > 500 else None
     except Exception:
         return None
@@ -273,7 +278,6 @@ def extract_vk_group(url):
             for s in soup(["script", "style"]): s.decompose()
             full = soup.get_text(separator="\n", strip=True)
             if len(full) > 500: return full[:5000]
-        # Fallbacks
         for fallback_url in [f"https://vk.com/{vk}"]:
             html = scrape_google_cache(fallback_url)
             if html:
@@ -348,18 +352,18 @@ def ask_qwen(prompt, max_tokens=1200, system=None):
     for attempt in range(3):
         try:
             r = groq_client.chat.completions.create(
-                model="qwen/qwen3.8-27b",
+                model="qwen/qwen3-32b",
                 messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt[:15000]}],
                 max_tokens=max_tokens, temperature=0.7, timeout=120
             )
             result = r.choices[0].message.content
             if r.choices[0].finish_reason == "length":
-                result += "\n\n[Ответ обрезан, основная информация передана]"
+                result += "\n\n[Ответ обрезан]"
             return result
         except Exception as e:
             logger.error(f"❌ Qwen fail {attempt+1}: {e}")
             if attempt < 2: time.sleep(2 ** attempt)
-    return "⚠️ Нейросеть недоступна. Нажми **▶️ Продолжить**."
+    return "⚠️ Нейросеть недоступна. Нажми ▶️ Продолжить."
 
 async def send_long(message, text):
     MAX = 4000
@@ -380,52 +384,55 @@ async def send_long(message, text):
 def is_banned(text):
     return any(w in text.lower() for w in BANNED_NICHES)
 
-# === ГЛАВНЫЕ КОМАНДЫ МЕНЮ ===
-@dp.message(Command("start"), Command("help"))
+# === ГЛАВНЫЕ КОМАНДЫ ===
+@dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
+    logger.info(f"🚀 /start from {message.from_user.id}")
     await state.clear()
     get_or_create_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
     await message.answer(
         "👋 **Привет! Я — твой SEO-стратег.**\n\n"
         "Проведу интервью, изучу нишу и буду писать статьи.\n"
-        "⏱ 5-7 минут.\n"
-        "📊 Всего 8 вопросов.\n\n"
+        "⏱ 5-7 минут. 📊 Всего 8 вопросов.\n\n"
         "❓ **Вопрос 1 из 8:**\nЧто продаёшь? Опиши в 2-3 предложениях.\n\n"
-        "💡 Используй кнопки внизу меню в любой момент.",
+        "💡 Используй кнопки в меню внизу.",
         parse_mode="Markdown",
         reply_markup=get_main_menu()
     )
     await state.set_state(Onboarding.gathering)
     await state.update_data(question_num=1, history=[], source_requested=False)
 
-# Обработчик кнопки "Начать заново"
-@dp.message(F.text == MENU_RESTART)
-async def btn_restart_kb(message: types.Message, state: FSMContext):
-    await cmd_start(message, state)
-
-# Обработчик кнопки "Помощь"
-@dp.message(F.text == MENU_HELP)
-async def btn_help_kb(message: types.Message):
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
     await message.answer(
         "📋 **Что я умею:**\n\n"
-        "• **▶️ Продолжить** — продолжить с последнего места (если отвлёкся)\n"
+        "• **▶️ Продолжить** — продолжить с последнего места\n"
         "• **📝 Новая статья** — сгенерировать статью\n"
-        "• **🔄 Начать заново** — начать интервью с нуля\n"
+        "• **🔄 Начать заново** — начать с нуля\n"
         "• **❓ Помощь** — эта справка\n"
         "• **/ping** — проверить что бот жив\n\n"
-        "💡 Просто нажимай кнопки в меню внизу!",
+        "💡 Просто нажимай кнопки в меню!",
         parse_mode="Markdown",
         reply_markup=get_main_menu()
     )
 
-# Обработчик кнопки "Продолжить"
+@dp.message(F.text == MENU_RESTART)
+async def btn_restart_kb(message: types.Message, state: FSMContext):
+    logger.info("🔄 Restart via menu")
+    await cmd_start(message, state)
+
+@dp.message(F.text == MENU_HELP)
+async def btn_help_kb(message: types.Message):
+    await cmd_help(message)
+
 @dp.message(F.text == MENU_CONTINUE)
 async def btn_continue_kb(message: types.Message, state: FSMContext):
+    logger.info("▶️ Continue via menu")
     await cmd_continue_logic(message, state)
 
-# Обработчик кнопки "Новая статья"
 @dp.message(F.text == MENU_ARTICLE)
 async def btn_article_kb(message: types.Message, state: FSMContext):
+    logger.info("📝 Article via menu")
     await gen_article_logic(message)
 
 @dp.message(Command("ping"))
@@ -439,54 +446,51 @@ async def cmd_continue_logic(message: types.Message, state: FSMContext):
     qn = data.get("question_num", 1)
     history = data.get("history", [])
     
+    logger.info(f"📊 Continue: state={current_state}, qn={qn}, hist={len(history)}")
+    
     if not current_state or (qn == 1 and not history):
         await message.answer(
-            "🤔 У тебя нет активного диалога.\nНажми **🔄 Начать заново** в меню.",
-            parse_mode="Markdown"
+            "🤔 У тебя нет активного диалога.\nНажми **🔄 Начать заново**.",
+            parse_mode="Markdown",
+            reply_markup=get_main_menu()
         )
         return
     
-    greeting = f"👋 **С возвращением!**\n"
-    
     if current_state == "Onboarding:gathering":
-        greeting += f"📊 Мы на **вопросе {qn} из 8**.\n"
-        greeting += f"Уже ответили на {len(history)} вопросов.\n\n"
-        greeting += "Продолжаем?"
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="▶️ Да, продолжить", callback_data="continue_action")],
             [InlineKeyboardButton(text="🔄 Начать заново", callback_data="restart_action")]
         ])
-        await message.answer(greeting, reply_markup=kb, parse_mode="Markdown")
-    
+        await message.answer(
+            f"👋 **С возвращением!**\n\n"
+            f"📊 Мы на **вопросе {qn} из 8**.\n"
+            f"Уже ответили на {len(history)} вопросов.\n\nПродолжаем?",
+            reply_markup=kb, parse_mode="Markdown"
+        )
     elif current_state == "Onboarding:source_link":
         await message.answer(
-            "🔗 Мы ждали ссылки на источники.\n"
-            "Пришли их или напиши **«нет»**.",
+            "🔗 Мы ждали ссылки на источники.\nПришли их или напиши **«нет»**.",
             parse_mode="Markdown"
         )
-    
     elif current_state == "Onboarding:waiting_source_parsing":
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Повторить парсинг", callback_data="retry_parsing")]
         ])
         await message.answer("⏳ Мы изучали источники. Повторить?", reply_markup=kb, parse_mode="Markdown")
-    
     elif current_state == "Onboarding:photos":
         kb = ReplyKeyboardMarkup(keyboard=[
             [KeyboardButton(text="📸 Фото")], [KeyboardButton(text="⏭ Пропустить")]
         ], resize_keyboard=True)
         await message.answer("📸 Мы загружали фото.", reply_markup=kb, parse_mode="Markdown")
-    
     elif current_state == "Onboarding:cta_choice":
         await message.answer("📍 Выбирали куда вести заявки.", parse_mode="Markdown")
         await ask_cta(message, state)
-    
     else:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="▶️ Продолжить", callback_data="continue_action")],
             [InlineKeyboardButton(text="🔄 Начать заново", callback_data="restart_action")]
         ])
-        await message.answer("🤔 Не могу определить где мы. Что делаем?", reply_markup=kb, parse_mode="Markdown")
+        await message.answer("🤔 Не могу определить где мы.", reply_markup=kb, parse_mode="Markdown")
 
 @dp.message(Command("continue"))
 async def cmd_continue(message: types.Message, state: FSMContext):
@@ -498,7 +502,6 @@ async def cb_continue_action(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     qn = data.get("question_num", 1)
     history = data.get("history", [])
-    
     if qn >= 8:
         await finish_interview(callback.message, state, history)
     else:
@@ -515,7 +518,7 @@ async def cb_retry_parsing(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(Onboarding.source_link)
     await state.update_data(waiting_manual=False)
     await callback.message.answer(
-        "🔗 Пришли ссылки на источники ещё раз.\nИли напиши **«нет»**.",
+        "🔗 Пришли ссылки ещё раз. Или напиши **«нет»**.",
         parse_mode="Markdown"
     )
 
@@ -543,7 +546,7 @@ async def ask_next_interview_question(message: types.Message, state: FSMContext)
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="continue_action")]
         ])
-        await message.answer("⚠️ Не удалось сгенерировать вопрос.", reply_markup=kb)
+        await message.answer("⚠️ Не удалось сгенерировать вопрос.", reply_markup=kb, reply_markup_fallback=get_main_menu())
         return
     
     nq = nq.strip()
@@ -552,11 +555,9 @@ async def ask_next_interview_question(message: types.Message, state: FSMContext)
     
     await state.update_data(question_num=qn + 1)
     
-    # Прогресс-бар
-    progress = f"📊 **Вопрос {qn} из 8**"
     await message.answer(
-        f"{progress}\n❓ {nq}\n\n"
-        "💡 Не знаешь что ответить — напиши **«не знаю»** или **«пропустить»**.",
+        f"📊 **Вопрос {qn} из 8**\n\n❓ {nq}\n\n"
+        "💡 Не знаешь — напиши **«не знаю»** или **«пропустить»**.",
         parse_mode="Markdown"
     )
 
@@ -565,9 +566,8 @@ async def ask_next_interview_question(message: types.Message, state: FSMContext)
 async def live_interview(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     
-    # Обработка "не знаю" / "пропустить"
-    if message.text.strip().lower() in ["не знаю", "пропустить", "не знаю", "незнаю", "пропусти", "дальше"]:
-        await message.answer("👌 Пропускаю этот вопрос.", parse_mode="Markdown")
+    if message.text.strip().lower() in ["не знаю", "пропустить", "незнаю", "пропусти", "дальше", "skip"]:
+        await message.answer("👌 Пропускаю.", parse_mode="Markdown")
         await ask_next_interview_question(message, state)
         return
     
@@ -577,7 +577,7 @@ async def live_interview(message: types.Message, state: FSMContext):
     src_req = data.get("source_requested", False)
 
     if qn == 1 and is_banned(message.text):
-        await message.answer("❌ Не работаю с этой темой.")
+        await message.answer("❌ Не работаю с этой темой.", reply_markup=get_main_menu())
         await state.clear()
         return
 
@@ -605,8 +605,7 @@ async def live_interview(message: types.Message, state: FSMContext):
             "✅ **Уже многое понял!**\n\n"
             "🔗 Пришли ссылки на источники (можно несколько):\n"
             "• 🌐 Сайт\n• ✈️ Telegram-канал\n• 📱 Авито\n• 💬 ВКонтакте\n\n"
-            "Изучу каждый (это займёт 30-90 сек).\n"
-            "Нет источника — напиши **«нет»**.",
+            "Изучу каждый (30-90 сек). Нет — напиши **«нет»**.",
             parse_mode="Markdown"
         )
         await state.set_state(Onboarding.source_link)
@@ -650,7 +649,7 @@ async def get_source(message: types.Message, state: FSMContext):
 📌 Сильные стороны (3 пункта)
 📌 Слабые места (2-3 пункта)
 📌 Стиль общения
-📌 Идеи для статей (2-3 идеи)
+📌 Идеи для статей (2-3)
 НЕ ЗАДАВАЙ ВОПРОСОВ.""", max_tokens=1500, system=RECON_SYSTEM)
         if not analysis.startswith("⚠️"):
             await send_long(message, f"📊 **Разведка:**\n{analysis}")
@@ -677,9 +676,8 @@ async def get_source(message: types.Message, state: FSMContext):
     await state.set_state(Onboarding.waiting_source_parsing)
     await state.update_data(urls_to_parse=urls)
     await message.answer(
-        f"⏳ **Нашёл {len(urls)} источник(ов). Изучаю каждый...**\n"
-        f"Это займёт 30-90 секунд.\n\n"
-        f"💡 Если долго не отвечаю — нажми **▶️ Продолжить** в меню.",
+        f"⏳ **Нашёл {len(urls)} источник(ов). Изучаю...** (30-90 сек)\n"
+        f"💡 Если долго — нажми **▶️ Продолжить**.",
         parse_mode="Markdown"
     )
 
@@ -704,10 +702,10 @@ async def get_source(message: types.Message, state: FSMContext):
 Интервью: {ht}
 Приоритет: {pri or 'не указан'}
 КРАТКАЯ разведка (800 слов):
-📌 Сильные стороны (3 пункта)
-📌 Слабые места (2-3 пункта)
+📌 Сильные стороны (3)
+📌 Слабые места (2-3)
 📌 Стиль общения
-📌 Идеи для статей (2-3 идеи)
+📌 Идеи для статей (2-3)
 НЕ ЗАДАВАЙ ВОПРОСОВ.""", max_tokens=1500, system=RECON_SYSTEM)
         if not analysis.startswith("⚠️"):
             await send_long(message, f"📊 **Результаты:**\n{results_text}\n\n**Разведка:**\n{analysis}")
@@ -715,12 +713,12 @@ async def get_source(message: types.Message, state: FSMContext):
             await send_long(message, f"📊 **Результаты:**\n{results_text}\n\n{analysis}")
         await state.update_data(history=history, source_requested=True, source_data=all_data[:3000], waiting_manual=False)
         await state.set_state(Onboarding.gathering)
-        await message.answer("✅ Готово! Продолжаем интервью.", parse_mode="Markdown")
+        await message.answer("✅ Готово! Продолжаем.", parse_mode="Markdown")
         await ask_next_interview_question(message, state)
     else:
         await message.answer(
             f"📊 **Результаты:**\n{results_text}\n\n"
-            f"Не смог открыть. Пришли **текстом**: описание, цены, услуги.",
+            f"Не смог открыть. Пришли **текстом**: описание, цены.",
             parse_mode="Markdown"
         )
         await state.update_data(waiting_manual=True)
@@ -733,9 +731,8 @@ async def finish_interview(message, state, history):
     pri = data.get("priority_service", "")
     src = data.get("source_data", "")
     await message.answer(
-        "✅ **Интервью завершено!**\n⏳ Делаю **полный анализ ниши**...\n"
-        "Это займёт 2-3 минуты.\n\n"
-        "💡 Если долго не отвечаю — нажми **▶️ Продолжить**.",
+        "✅ **Интервью завершено!**\n⏳ Делаю **полный анализ** (2-3 мин).\n"
+        "💡 Если долго — нажми **▶️ Продолжить**.",
         parse_mode="Markdown"
     )
 
@@ -752,14 +749,14 @@ async def finish_interview(message, state, history):
 Конкуренты: {comp_text}
 Яндекс: {sugg_text}
 ПОЛНЫЙ АНАЛИЗ:
-🎯 КЛЮЧИ (15 запросов)
-💥 БОЛИ (10 болей)
+🎯 КЛЮЧИ (15)
+💥 БОЛИ (10)
 ⭐ УТП (3-4 предложения)
-⚠️ МИНУСЫ (2-3 места)
+⚠️ МИНУСЫ (2-3)
 НЕ ЗАДАВАЙ ВОПРОСОВ.""", max_tokens=2500, system=FINAL_ANALYSIS_SYSTEM)
 
     if analysis.startswith("⚠️"):
-        await message.answer(f"⚠️ {analysis}\nНажми **▶️ Продолжить**.", parse_mode="Markdown")
+        await message.answer(f"⚠️ {analysis}", reply_markup=get_main_menu())
         return
 
     plan = ask_qwen(f"""Анализ: {analysis[:3000]}
@@ -829,7 +826,7 @@ async def cta_value(message, state: FSMContext):
     try: supabase.table("users").update({"cta_value": message.text.strip()}).eq("id", message.from_user.id).execute()
     except Exception: pass
     await message.answer(
-        "🎉 **Готово!**\nНажми **📝 Новая статья** в меню чтобы получить первую статью.",
+        "🎉 **Готово!**\nНажми **📝 Новая статья** чтобы получить первую статью.",
         parse_mode="Markdown",
         reply_markup=get_main_menu()
     )
@@ -895,11 +892,7 @@ async def skip_vc(callback):
     await callback.message.answer("👌 Только Дзен.", reply_markup=get_main_menu())
     await callback.answer()
 
-# === HELP / ADMIN ===
-@dp.message(Command("help"))
-async def cmd_help(message):
-    await btn_help_kb(message)
-
+# === ADMIN ===
 @dp.message(Command("admin"))
 async def cmd_admin(message):
     if message.from_user.id != ADMIN_ID: return
@@ -918,4 +911,5 @@ async def main():
 if __name__ == "__main__":
     threading.Thread(target=start_health_server, daemon=True).start()
     threading.Thread(target=heartbeat, daemon=True).start()
+    logger.info("✅ Threads started, running main...")
     asyncio.run(main())
