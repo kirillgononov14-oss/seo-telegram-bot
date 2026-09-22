@@ -5,7 +5,6 @@ import threading
 import asyncio
 import time
 import re
-from io import BytesIO
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command
@@ -20,16 +19,16 @@ from openai import OpenAI
 from supabase import create_client, Client
 from bs4 import BeautifulSoup
 from duckduckgo_search import DDGS
-from typing import Callable, Dict, Any, Awaitable
+from typing import Callable, Dict, Any
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")
-SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY")  # НОВЫЙ КЛЮЧ
+SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY")
 ADMIN_ID = 1847007101
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN)
@@ -41,13 +40,22 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 BANNED_NICHES = ["обнал", "отмыв", "адалт", "18+", "порн", "оружие", "наркот", "взлом", "хакер"]
 
 SYSTEM_PROMPT = """Ты — элитный SEO-стратег и контент-маркетолог с 15-летним опытом.
+Работаешь как настоящий живой маркетолог на брифе.
+
+ПРАВИЛА ФОРМАТИРОВАНИЯ:
+- НЕ используй символы ### или ##
+- Используй эмодзи для заголовков (🎯 📌 💥 ⭐ ⚠️ 📅)
+- Выделяй важное **жирным**
+- Пиши списками с тире или цифрами
+- Разделяй блоки пустой строкой
+- ВСЕГДА заканчивай ответ полностью, не обрывай на полуслове
+
 ПРИНЦИПЫ:
 1. Живое интервью: по одному вопросу, внимательно читай ответы
 2. Несколько услуг = разные ниши. Спроси приоритет
 3. Анализируй ТОЛЬКО реальные данные. Не выдумывай
 4. Статья = 1 ключ + 1 боль. Язык читателя, решай боль
-5. Форматирование: эмодзи, **жирный**, списки
-ВСЕГДА НА РУССКОМ."""
+5. Всегда отвечай на русском языке"""
 
 class Onboarding(StatesGroup):
     gathering = State()
@@ -65,9 +73,9 @@ class ErrorHandlerMiddleware(BaseMiddleware):
             logger.error(f"❌ ОШИБКА: {type(e).__name__}: {e}", exc_info=True)
             try:
                 if hasattr(event, 'message') and event.message:
-                    await event.message.answer(f"⚠️ Ошибка. /start\n{str(e)[:100]}")
+                    await event.message.answer(f"⚠️ Ошибка. Напиши /start\n{str(e)[:100]}")
                 elif hasattr(event, 'callback_query') and event.callback_query:
-                    await event.callback_query.message.answer("⚠️ Ошибка. /start")
+                    await event.callback_query.message.answer("⚠️ Ошибка. Напиши /start")
             except Exception:
                 pass
             return None
@@ -92,224 +100,160 @@ def heartbeat():
         time.sleep(60)
         logger.info("💓 HEARTBEAT: alive")
 
-# === ГЛАВНАЯ ФУНКЦИЯ ПАРСИНГА ЧЕРЕЗ SCRAPERAPI ===
-def scrape_with_api(url, premium=False, country_code="ru"):
-    """
-    Парсит любой сайт через ScraperAPI.
-    premium=True — для сложных сайтов (Авито, ВК) с защитой от ботов
-    """
+# === SCRAPERAPI ===
+def scrape_with_api(url, premium=False, render=False, country_code="ru"):
     if not SCRAPER_API_KEY:
         logger.error("❌ SCRAPER_API_KEY не задан!")
         return None
-    
     params = {
         "api_key": SCRAPER_API_KEY,
         "url": url,
+        "country_code": country_code,
     }
-    
-    # Для сложных сайтов используем premium + локацию РФ
     if premium:
         params["premium"] = "true"
-        params["country_code"] = country_code
-    
+    if render:
+        params["render"] = "true"
     try:
-        logger.info(f"🌐 Scraping {url} (premium={premium})...")
-        r = requests.get(
-            "http://api.scraperapi.com",
-            params=params,
-            timeout=60
-        )
-        
-        if r.status_code == 200:
-            # Проверяем что не получили капчу или пустую страницу
-            if len(r.text) < 200:
-                logger.warning(f"⚠️ Слишком короткий ответ для {url}: {len(r.text)} chars")
-                return None
-            if "captcha" in r.text.lower() or "robot" in r.text.lower():
-                logger.warning(f"⚠️ Капча на {url}")
+        logger.info(f"🌐 Scraping {url} (premium={premium}, render={render})...")
+        r = requests.get("http://api.scraperapi.com", params=params, timeout=90)
+        if r.status_code == 200 and len(r.text) > 200:
+            if "captcha" in r.text.lower() and len(r.text) < 1000:
+                logger.warning(f"⚠️ Captcha on {url}")
                 return None
             logger.info(f"✅ Scraped {url}: {len(r.text)} chars")
             return r.text
-        else:
-            logger.error(f"❌ ScraperAPI error {r.status_code} for {url}")
-            return None
+        logger.warning(f"⚠️ ScraperAPI status {r.status_code}, len={len(r.text)} for {url}")
+        return None
     except Exception as e:
-        logger.error(f"❌ Scrape error for {url}: {e}")
+        logger.error(f"❌ Scrape error {url}: {e}")
         return None
 
-# === ИЗВЛЕЧЕНИЕ ССЫЛОК ===
 def extract_urls(text):
     return re.findall(r'https?://[^\s,;]+', text)
 
 def detect_source_type(url):
     u = url.lower()
-    if "avito.ru" in u:
-        return "avito"
-    elif "vk.com" in u or "vk.ru" in u:
-        return "vk"
-    elif "t.me/" in u:
-        return "telegram"
-    else:
-        return "site"
+    if "avito.ru" in u: return "avito"
+    elif "vk.com" in u or "vk.ru" in u: return "vk"
+    elif "t.me/" in u: return "telegram"
+    else: return "site"
 
 def parse_source(url):
     st = detect_source_type(url)
-    if st == "avito":
-        return extract_avito(url), "Авито"
-    elif st == "vk":
-        return extract_vk_group(url), "ВКонтакте"
-    elif st == "telegram":
-        return extract_telegram_channel(url), "Telegram"
-    else:
-        return extract_site_text(url), "Сайт"
+    if st == "avito": return extract_avito(url), "Авито"
+    elif st == "vk": return extract_vk_group(url), "ВКонтакте"
+    elif st == "telegram": return extract_telegram_channel(url), "Telegram"
+    else: return extract_site_text(url), "Сайт"
 
-# === ПАРСЕРЫ ЧЕРЕЗ SCRAPERAPI ===
 def extract_site_text(url):
     try:
-        if not url.startswith("http"):
-            url = "https://" + url
-        
-        # Обычный сайт — без premium (экономим лимит)
-        html = scrape_with_api(url, premium=False)
-        if not html:
-            return None
-        
+        if not url.startswith("http"): url = "https://" + url
+        html = scrape_with_api(url, premium=False, render=False)
+        if not html: return None
         soup = BeautifulSoup(html, "lxml")
-        for s in soup(["script", "style", "nav", "footer", "header", "noscript"]):
-            s.decompose()
+        for s in soup(["script", "style", "nav", "footer", "header", "noscript"]): s.decompose()
         text = soup.get_text(separator="\n", strip=True)
-        
-        if len(text) < 100:
-            return None
-        
-        logger.info(f"✅ Site extracted: {len(text)} chars")
-        return text[:5000]
+        return text[:5000] if len(text) > 100 else None
     except Exception as e:
-        logger.error(f"❌ Site parse error: {e}")
+        logger.error(f"❌ Site: {e}")
         return None
 
 def extract_telegram_channel(url):
     try:
         ch = url.replace("https://t.me/", "").replace("t.me/", "").strip("/").split("/")[0]
-        public_url = f"https://t.me/s/{ch}"
-        
-        html = scrape_with_api(public_url, premium=False)
-        if not html:
-            return None
-        
+        html = scrape_with_api(f"https://t.me/s/{ch}", premium=False, render=False)
+        if not html: return None
         soup = BeautifulSoup(html, "lxml")
         posts = [p.get_text(strip=True) for p in soup.find_all("div", class_="tgme_widget_message_text") if p.get_text(strip=True)]
-        
-        if not posts:
-            return None
-        
-        logger.info(f"✅ TG extracted: {len(posts)} posts")
-        return "\n\n".join(posts[:10])[:5000]
+        return "\n\n".join(posts[:10])[:5000] if posts else None
     except Exception as e:
-        logger.error(f"❌ TG parse error: {e}")
+        logger.error(f"❌ TG: {e}")
         return None
 
 def extract_avito(url):
     try:
-        if not url.startswith("http"):
-            url = "https://" + url
-        
-        # Авито — ОБЯЗАТЕЛЬНО premium + РФ (иначе не работает)
-        html = scrape_with_api(url, premium=True, country_code="ru")
-        if not html:
-            return None
-        
-        soup = BeautifulSoup(html, "lxml")
-        
-        # Собираем весь текст со страницы
-        description = []
-        
-        # Заголовок
-        for tag in soup.find_all(["h1", "h2", "h3"]):
-            text = tag.get_text(strip=True)
-            if text and len(text) > 5:
-                description.append(text)
-        
-        # Описание объявления
-        for tag in soup.find_all(["div", "p", "span"]):
-            text = tag.get_text(strip=True)
-            if len(text) > 20 and any(c in text.lower() for c in ["руб", "₽", "дом", "м²", "участок", "этаж", "площадь", "комнат"]):
-                if text not in description:
-                    description.append(text)
-        
-        result = "\n".join(description)
-        
-        if len(result) < 200:
-            # Пробуем достать весь видимый текст
-            for s in soup(["script", "style"]):
-                s.decompose()
-            result = soup.get_text(separator="\n", strip=True)
-        
-        if len(result) < 200:
-            return None
-        
-        logger.info(f"✅ Avito extracted: {len(result)} chars")
-        return result[:5000]
+        if not url.startswith("http"): url = "https://" + url
+        # Пробуем 3 варианта
+        variants = [
+            (url, True, True),           # Оригинал + premium + render
+            (url.replace("www.avito.ru", "m.avito.ru"), True, True),  # Мобильная
+            (url, True, False),           # Premium без render
+        ]
+        for variant_url, prem, rend in variants:
+            html = scrape_with_api(variant_url, premium=prem, render=rend)
+            if not html: continue
+            soup = BeautifulSoup(html, "lxml")
+            # Ищем описание
+            parts = []
+            for tag in soup.find_all(["h1", "h2", "h3"]):
+                t = tag.get_text(strip=True)
+                if t and len(t) > 5: parts.append(t)
+            for tag in soup.find_all(["div", "p", "span"]):
+                t = tag.get_text(strip=True)
+                if len(t) > 20 and any(w in t.lower() for w in ["руб", "₽", "дом", "м²", "участок", "этаж", "площадь"]):
+                    if t not in parts: parts.append(t)
+            result = "\n".join(parts)
+            if len(result) > 200:
+                logger.info(f"✅ Avito: {len(result)} chars")
+                return result[:5000]
+            # Пробуем весь текст
+            for s in soup(["script", "style"]): s.decompose()
+            full = soup.get_text(separator="\n", strip=True)
+            if len(full) > 500:
+                logger.info(f"✅ Avito full: {len(full)} chars")
+                return full[:5000]
+        return None
     except Exception as e:
-        logger.error(f"❌ Avito parse error: {e}")
+        logger.error(f"❌ Avito: {e}")
         return None
 
 def extract_vk_group(url):
     try:
         vk = url.replace("https://vk.com/", "").replace("https://vk.ru/", "")
         vk = vk.replace("vk.com/", "").replace("vk.ru/", "").strip("/").split("/")[0]
-        
-        # ВК — ОБЯЗАТЕЛЬНО premium + РФ
-        public_url = f"https://vk.com/{vk}"
-        html = scrape_with_api(public_url, premium=True, country_code="ru")
-        if not html:
-            return None
-        
-        soup = BeautifulSoup(html, "lxml")
-        
-        posts = []
-        # Ищем посты
-        for p in soup.find_all(["div", "p"]):
-            text = p.get_text(strip=True)
-            if len(text) > 40 and len(text) < 2000:
-                # Фильтруем мусорные элементы
-                if not any(skip in text.lower() for skip in ["cookie", "браузер", "войти", "зарегистрироваться"]):
-                    posts.append(text)
-        
-        # Убираем дубли
-        unique_posts = []
-        seen = set()
-        for p in posts:
-            if p not in seen:
-                seen.add(p)
-                unique_posts.append(p)
-        posts = unique_posts[:15]
-        
-        # Описание группы
-        desc = ""
-        for d in soup.find_all(["div", "p"], class_=["group_info", "page_info", "group_description", "info"]):
-            desc += d.get_text(strip=True) + "\n"
-        
-        if not posts and not desc:
-            # Пробуем достать весь текст
-            for s in soup(["script", "style"]):
-                s.decompose()
-            full_text = soup.get_text(separator="\n", strip=True)
-            if len(full_text) > 500:
-                logger.info(f"✅ VK full text: {len(full_text)} chars")
-                return full_text[:5000]
-            return None
-        
-        result = ""
-        if desc:
-            result += "ОПИСАНИЕ ГРУППЫ:\n" + desc + "\n\n"
-        if posts:
-            result += "ПОСЛЕДНИЕ ПОСТЫ:\n" + "\n---\n".join(posts[:10])
-        
-        logger.info(f"✅ VK extracted: {len(result)} chars, {len(posts)} posts")
-        return result[:5000]
+        # Пробуем 3 варианта
+        variants = [
+            f"https://m.vk.com/{vk}",     # Мобильная (проще парсится)
+            f"https://vk.com/{vk}",        # Обычная
+            f"https://m.vk.com/{vk}?act=info",  # Информация
+        ]
+        for variant_url in variants:
+            html = scrape_with_api(variant_url, premium=True, render=True)
+            if not html: continue
+            soup = BeautifulSoup(html, "lxml")
+            posts = []
+            for p in soup.find_all(["div", "p"]):
+                t = p.get_text(strip=True)
+                if 40 < len(t) < 2000 and not any(skip in t.lower() for skip in ["cookie", "войти", "зарегистрироваться", "браузер"]):
+                    posts.append(t)
+            # Убираем дубли
+            unique = []
+            seen = set()
+            for p in posts:
+                if p not in seen:
+                    seen.add(p)
+                    unique.append(p)
+            posts = unique[:15]
+            desc = ""
+            for d in soup.find_all(["div", "p"], class_=["group_info", "page_info", "group_description", "info"]):
+                desc += d.get_text(strip=True) + "\n"
+            if posts or desc:
+                result = ""
+                if desc: result += "ОПИСАНИЕ:\n" + desc + "\n\n"
+                if posts: result += "ПОСТЫ:\n" + "\n---\n".join(posts[:10])
+                if len(result) > 200:
+                    logger.info(f"✅ VK: {len(result)} chars, {len(posts)} posts")
+                    return result[:5000]
+            # Весь текст
+            for s in soup(["script", "style"]): s.decompose()
+            full = soup.get_text(separator="\n", strip=True)
+            if len(full) > 500:
+                logger.info(f"✅ VK full: {len(full)} chars")
+                return full[:5000]
+        return None
     except Exception as e:
-        logger.error(f"❌ VK parse error: {e}")
+        logger.error(f"❌ VK: {e}")
         return None
 
 def search_competitors(q, max_results=5):
@@ -318,50 +262,47 @@ def search_competitors(q, max_results=5):
             results = list(ddgs.text(f"{q} цены отзывы", region="ru-ru", max_results=max_results))
             return [{"title": r.get("title", ""), "snippet": r.get("body", "")[:200]} for r in results]
     except Exception as e:
-        logger.error(f"❌ Search error: {e}")
+        logger.error(f"❌ Search: {e}")
         return []
 
 def get_yandex_suggestions(kw):
     try:
-        r = requests.get("https://suggest.yandex.net/suggest-ff.cgi",
-                         params={"part": kw, "lang": "ru", "v": "3"},
-                         timeout=10)
+        r = requests.get("https://suggest.yandex.net/suggest-ff.cgi", params={"part": kw, "lang": "ru", "v": "3"}, timeout=10)
         data = r.json()
         return data[1] if isinstance(data, list) and len(data) > 1 else []
     except Exception as e:
-        logger.error(f"❌ Yandex error: {e}")
+        logger.error(f"❌ Yandex: {e}")
         return []
 
 # === SUPABASE ===
 def get_or_create_user(uid, username, fname):
     try:
         result = supabase.table("users").select("*").eq("id", uid).execute()
-        if result.data:
-            return result.data[0]
+        if result.data: return result.data[0]
         u = {"id": uid, "username": username or "", "first_name": fname or ""}
         supabase.table("users").insert(u).execute()
         return u
     except Exception as e:
-        logger.error(f"❌ User error: {e}")
+        logger.error(f"❌ User: {e}")
         return {"id": uid}
 
 def save_answer(uid, q, a):
     try:
         supabase.table("onboarding_answers").insert({"user_id": uid, "question": q, "answer": str(a)[:1500]}).execute()
     except Exception as e:
-        logger.error(f"❌ Save answer: {e}")
+        logger.error(f"❌ Save: {e}")
 
 def save_research(uid, kw, pains, utp, comp):
     try:
         supabase.table("niche_research").insert({"user_id": uid, "keywords": str(kw)[:8000], "pains": str(pains)[:5000], "utp": str(utp)[:2000], "competitors": str(comp)[:3000]}).execute()
     except Exception as e:
-        logger.error(f"❌ Save research: {e}")
+        logger.error(f"❌ Research: {e}")
 
 def save_article(uid, kw, pain, title, content):
     try:
         supabase.table("articles").insert({"user_id": uid, "keyword": str(kw)[:500], "pain": str(pain)[:500], "title": str(title)[:500], "content": str(content)[:15000], "status": "draft"}).execute()
     except Exception as e:
-        logger.error(f"❌ Save article: {e}")
+        logger.error(f"❌ Article: {e}")
 
 def log_usage(uid, action):
     try:
@@ -374,36 +315,35 @@ def ask_qwen(prompt, max_tokens=1200, system=None):
     sys_msg = system or SYSTEM_PROMPT
     for attempt in range(3):
         try:
-            logger.info(f"🤖 Qwen attempt {attempt+1}...")
+            logger.info(f"🤖 Qwen attempt {attempt+1}, max_tokens={max_tokens}...")
             r = groq_client.chat.completions.create(
                 model="qwen/qwen3.8-27b",
                 messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt[:15000]}],
-                max_tokens=max_tokens, temperature=0.7, timeout=90
+                max_tokens=max_tokens, temperature=0.7, timeout=120
             )
             result = r.choices[0].message.content
-            logger.info(f"✅ Qwen: {len(result)} chars")
+            # Проверяем что ответ не оборвался
+            finish = r.choices[0].finish_reason
+            if finish == "length":
+                logger.warning(f"⚠️ Qwen response truncated (hit max_tokens={max_tokens})")
+                result += "\n\n[...анализ продолжается в следующем сообщении]"
+            logger.info(f"✅ Qwen: {len(result)} chars, finish={finish}")
             return result
         except Exception as e:
             logger.error(f"❌ Qwen fail {attempt+1}: {e}")
-            if attempt < 2:
-                time.sleep(2 ** attempt)
-    return f"⚠️ Нейросеть недоступна. Попробуй позже."
+            if attempt < 2: time.sleep(2 ** attempt)
+    return "⚠️ Нейросеть недоступна. Попробуй позже."
 
-# === ОТПРАВКА ===
 async def send_long(message, text):
     MAX = 4000
     try:
         if len(text) <= MAX:
-            try:
-                await message.answer(text, parse_mode="Markdown")
-            except Exception:
-                await message.answer(text)
+            try: await message.answer(text, parse_mode="Markdown")
+            except Exception: await message.answer(text)
         else:
             for part in [text[i:i+MAX] for i in range(0, len(text), MAX)]:
-                try:
-                    await message.answer(part, parse_mode="Markdown")
-                except Exception:
-                    await message.answer(part)
+                try: await message.answer(part, parse_mode="Markdown")
+                except Exception: await message.answer(part)
                 await asyncio.sleep(0.5)
     except Exception as e:
         logger.error(f"❌ Send: {e}")
@@ -457,8 +397,8 @@ async def live_interview(message: types.Message, state: FSMContext):
                 await state.update_data(history=history, question_num=2, multiple_services=services)
                 kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=s, callback_data=f"svc_{i}")] for i, s in enumerate(services)])
                 await message.answer(
-                    f"🎯 **Вижу несколько направлений:**\n" + "\n".join([f"• {s}" for s in services]) +
-                    f"\n\nЭто **разные ниши**. По какой делаем анализ первым?",
+                    "🎯 **Вижу несколько направлений:**\n" + "\n".join([f"• {s}" for s in services]) +
+                    "\n\nЭто **разные ниши**. По какой делаем анализ первым?",
                     reply_markup=kb, parse_mode="Markdown"
                 )
                 await state.set_state(Onboarding.service_priority)
@@ -481,9 +421,15 @@ async def live_interview(message: types.Message, state: FSMContext):
         await finish_interview(message, state, history)
         return
 
+    await ask_and_send_next_question(message, state, history, qn, data)
+
+async def ask_and_send_next_question(message, state, history, qn, data):
+    """Задаёт следующий вопрос интервью"""
     hist = "\n".join([f"Q{i['q']}: {i['a']}" for i in history])
     pri = data.get("priority_service", "")
-    pq = f"История ({qn} вопросов):\n{hist}\n" + (f"Приоритет: {pri}\n" if pri else "") + "\nЗадай следующий вопрос (открытый). ТОЛЬКО вопрос."
+    pq = f"История ({qn} вопросов):\n{hist}\n"
+    if pri: pq += f"Приоритет: {pri}\n"
+    pq += "\nЗадай следующий конкретный вопрос (открытый, не да/нет). Напиши ТОЛЬКО вопрос, без вступлений и без символов ###."
     nq = ask_qwen(pq, max_tokens=200)
     if nq.startswith("⚠️"):
         await message.answer(f"⚠️ {nq}\nПопробуй ещё раз или /start")
@@ -503,7 +449,7 @@ async def service_chosen(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(priority_service=pri, history=history, question_num=2)
     await state.set_state(Onboarding.gathering)
     ht = "\n".join([f"Q{i['q']}: {i['a']}" for i in history])
-    nq = ask_qwen(f"Клиент выбрал: {pri}\nБизнес: {ht}\nВопрос о страхах. ТОЛЬКО вопрос.", max_tokens=200)
+    nq = ask_qwen(f"Клиент выбрал: {pri}\nБизнес: {ht}\nЗадай вопрос о страхах клиентов по этой услуге. ТОЛЬКО вопрос.", max_tokens=200)
     if not nq.startswith("⚠️"):
         await callback.message.answer(f"❓ **Вопрос 2:**\n{nq}", parse_mode="Markdown")
     await callback.answer()
@@ -516,36 +462,49 @@ async def get_source(message: types.Message, state: FSMContext):
     history = data.get("history", [])
     waiting_manual = data.get("waiting_manual", False)
 
+    # Если клиент прислал текст вручную (запасной вариант)
     if waiting_manual:
         await message.answer("⏳ Изучаю текст...")
         src = message.text
         save_answer(uid, "source_data", src[:2000])
         ht = "\n".join([f"Q{i['q']}: {i['a']}" for i in history])
         pri = data.get("priority_service", "")
-        analysis = ask_qwen(f"""Клиент прислал: {src}
-Интервью: {ht}
+        analysis = ask_qwen(f"""Клиент прислал информацию о бизнесе:
+{src}
+
+Из интервью:
+{ht}
 Приоритет: {pri or 'не указан'}
 
-Проанализируй ЧЕСТНО:
-📌 Сильные стороны (3-4)
-📌 Слабые места (2-3)
-📌 Стиль общения
-📌 Что использовать в статьях
-Задай 2-3 вопроса.""", max_tokens=700)
+Проанализируй ЧЕСТНО (только на основе данных, не выдумывай):
+📌 Сильные стороны (3-4 пункта)
+📌 Слабые места (2-3 пункта)
+📌 Стиль общения (2-3 предложения)
+📌 Что использовать в статьях (3-4 идеи)
+
+В конце задай 2-3 конкретных уточняющих вопроса клиенту.
+Не используй символы ###. Пиши обычным текстом с эмодзи.""", max_tokens=1500)
+
         if not analysis.startswith("⚠️"):
             await send_long(message, f"✅ **Изучил!**\n\n{analysis}")
-        await state.update_data(history=history, question_num=data.get("question_num", 4), source_requested=True, source_data=src[:2000], waiting_manual=False)
+        else:
+            await message.answer(f"⚠️ {analysis}")
+
+        await state.update_data(history=history, question_num=data.get("question_num", 5), source_requested=True, source_data=src[:2000], waiting_manual=False)
         await state.set_state(Onboarding.gathering)
+        # ВАЖНО: продолжаем интервью — задаём следующий вопрос
+        await ask_and_send_next_question(message, state, history, data.get("question_num", 5), data)
         return
 
     answer = message.text.strip()
     save_answer(uid, "source_link", answer)
 
-    if answer.lower() in ["нет", "нету", "-", "0", "нет источника"]:
+    # Если "нет"
+    if answer.lower() in ["нет", "нету", "-", "0", "нет источника", "отсутствует"]:
         await message.answer("👌 Работаем без источника.", parse_mode="Markdown")
         await state.update_data(source_requested=True, source_data=None, waiting_manual=False)
         await state.set_state(Onboarding.gathering)
-        await continue_interview(message, state, history)
+        await ask_and_send_next_question(message, state, history, data.get("question_num", 5), data)
         return
 
     urls = extract_urls(answer)
@@ -574,46 +533,54 @@ async def get_source(message: types.Message, state: FSMContext):
         save_answer(uid, "source_data", all_data[:3000])
         ht = "\n".join([f"Q{i['q']}: {i['a']}" for i in history])
         pri = data.get("priority_service", "")
-        analysis = ask_qwen(f"""Данные источников:
-{all_data[:5000]}
 
-Интервью: {ht}
+        analysis = ask_qwen(f"""Данные из источников клиента:
+{all_data[:6000]}
+
+Из интервью:
+{ht}
 Приоритет: {pri or 'не указан'}
 
-Проанализируй ЧЕСТНО:
-📌 Сильные стороны (3-4)
-📌 Слабые места (2-3)
-📌 Стиль общения
-📌 Что использовать в статьях
-Задай 2-3 вопроса.""", max_tokens=700)
+Проанализируй ЧЕСТНО (только на основе данных, не выдумывай):
+📌 Сильные стороны (3-4 пункта)
+📌 Слабые места, мешающие продажам (2-3 пункта)
+📌 Стиль общения (2-3 предложения)
+📌 Что использовать в статьях (3-4 идеи)
+
+В конце задай 2-3 конкретных уточняющих вопроса клиенту.
+Не используй символы ###. Пиши обычным текстом с эмодзи и **жирным**.
+ОТВЕТ ДОЛЖЕН БЫТЬ ПОЛНЫМ — не обрывай на полуслове.""", max_tokens=1500)
+
         if not analysis.startswith("⚠️"):
-            await send_long(message, f"📊 **Результаты:**\n{results_text}\n\n{analysis}")
+            await send_long(message, f"📊 **Результаты изучения:**\n{results_text}\n\n{analysis}")
         else:
             await send_long(message, f"📊 **Результаты:**\n{results_text}\n\n{analysis}")
-        await state.update_data(history=history, question_num=data.get("question_num", 4), source_requested=True, source_data=all_data[:3000], waiting_manual=False)
+
+        await state.update_data(
+            history=history,
+            question_num=data.get("question_num", 5),
+            source_requested=True,
+            source_data=all_data[:3000],
+            waiting_manual=False
+        )
     else:
         await message.answer(
             f"📊 **Результаты:**\n{results_text}\n\n"
-            f"Не смог открыть автоматически. "
+            f"Не смог открыть автоматически.\n"
             f"Пришли **текстом**: описание, цены, услуги.",
             parse_mode="Markdown"
         )
         await state.update_data(waiting_manual=True)
         return
 
+    # ВАЖНО: продолжаем интервью — задаём следующий вопрос
     await state.set_state(Onboarding.gathering)
-
-async def continue_interview(message, state, history):
     data = await state.get_data()
     qn = data.get("question_num", 5)
     if qn >= 8:
         await finish_interview(message, state, history)
-        return
-    ht = "\n".join([f"Q{i['q']}: {i['a']}" for i in history])
-    nq = ask_qwen(f"История: {ht}\nЗадай следующий вопрос. ТОЛЬКО вопрос.", max_tokens=200)
-    if not nq.startswith("⚠️"):
-        await state.update_data(history=history, question_num=qn + 1)
-        await message.answer(f"❓ **Вопрос {qn + 1}:**\n{nq}", parse_mode="Markdown")
+    else:
+        await ask_and_send_next_question(message, state, history, qn, data)
 
 # === ЗАВЕРШЕНИЕ ===
 async def finish_interview(message, state, history):
@@ -634,27 +601,35 @@ async def finish_interview(message, state, history):
     analysis = ask_qwen(f"""Интервью: {ht}{src_sec}
 Приоритет: {pri or 'нет'}
 Конкуренты: {comp_text}
-Яндекс: {sugg_text}
+Подсказки Яндекса: {sugg_text}
 
-1. 15 ключей
+Проведи анализ:
+1. 15 ключевых запросов
 2. 10 болей ЦА
-3. УТП
-4. Минусы
+3. УТП (3-4 предложения)
+4. Минусы позиционирования
 
-=== 🎯 КЛЮЧИ ===
-=== 💥 БОЛИ ===
-=== ⭐ УТП ===
-=== ⚠️ МИНУСЫ ===""", max_tokens=1200)
+Оформи блоками:
+🎯 КЛЮЧИ
+💥 БОЛИ
+⭐ УТП
+⚠️ МИНУСЫ
+
+Не используй ###. Ответ должен быть ПОЛНЫМ.""", max_tokens=1500)
 
     if analysis.startswith("⚠️"):
         await message.answer(f"⚠️ {analysis}")
         return
 
     plan = ask_qwen(f"""Анализ: {analysis}
-Контент-план на 7 дней для Дзен. 1 статья = 1 ключ + 1 боль. День + ЧАС.
-=== 📅 ПЛАН ===""", max_tokens=900)
+Контент-план на 7 дней для Дзен. 1 статья = 1 ключ + 1 боль.
+Укажи: ключ, боль, тип, день, ЧАС публикации, длину.
+📅 ПЛАН
+Не используй ###.""", max_tokens=1200)
 
-    guide = ask_qwen("""Инструкция чайнику: публикация в Дзен. 5 шагов. Аналогия с магазином.""", max_tokens=800)
+    guide = ask_qwen("""Инструкция для чайника: как опубликовать SEO-статью в Дзен для трафика из Яндекса и Гугла.
+5 шагов. Объясни Title, Description, H1 через аналогию с магазином.
+Не используй ###.""", max_tokens=1000)
 
     save_research(uid, analysis + "\n\n" + plan, "", "", comp_text)
 
@@ -668,11 +643,11 @@ async def finish_interview(message, state, history):
     await asyncio.sleep(1)
 
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📸 Фото")], [KeyboardButton(text="⏭ Пропустить")]], resize_keyboard=True)
-    await message.answer("📸 **Загрузить фото работ?**", reply_markup=kb, parse_mode="Markdown")
+    await message.answer("📸 **Загрузить фото работ?** Можно сейчас или позже.", reply_markup=kb, parse_mode="Markdown")
     await state.set_state(Onboarding.photos)
 
 # === ФОТО ===
-@dp.message(Onboarding.photos, F.text.in_(["⏭ Пропустить", "Позже", "позже", "Не сейчас", "нет", "Нет"]))
+@dp.message(Onboarding.photos, F.text.in_(["⏭ Пропустить", "Позже", "позже", "Не сейчас", "нет", "Нет", "пропустить"]))
 async def skip_photos(message, state: FSMContext):
     await message.answer("👌 Генерирую сам.")
     await ask_cta(message, state)
@@ -681,7 +656,7 @@ async def skip_photos(message, state: FSMContext):
 async def req_photos(message, state: FSMContext):
     await message.answer("📸 Пришли фото. Закончишь — **«готово»** или **«позже»**.", parse_mode="Markdown")
 
-@dp.message(Onboarding.photos, F.text.lower() == "готово")
+@dp.message(Onboarding.photos, F.text.lower().in_(["готово", "Готово"]))
 async def photos_done(message, state: FSMContext):
     await message.answer("✅ Принял!")
     await ask_cta(message, state)
@@ -703,10 +678,8 @@ async def ask_cta(message, state: FSMContext):
 @dp.callback_query(F.data.startswith("cta_"))
 async def cta_chosen(callback, state: FSMContext):
     ct = callback.data.replace("cta_", "")
-    try:
-        supabase.table("users").update({"cta_type": ct}).eq("id", callback.from_user.id).execute()
-    except Exception:
-        pass
+    try: supabase.table("users").update({"cta_type": ct}).eq("id", callback.from_user.id).execute()
+    except Exception: pass
     prompts = {"site": "🌐 Ссылка на форму", "tg": "✈️ @username", "wa": "📱 Номер +7...", "max": "📣 Ссылка МАХ", "phone": "📞 Номер"}
     await state.update_data(cta_type=ct)
     await state.set_state(Onboarding.cta_value)
@@ -715,10 +688,8 @@ async def cta_chosen(callback, state: FSMContext):
 
 @dp.message(Onboarding.cta_value)
 async def cta_value(message, state: FSMContext):
-    try:
-        supabase.table("users").update({"cta_value": message.text.strip()}).eq("id", message.from_user.id).execute()
-    except Exception:
-        pass
+    try: supabase.table("users").update({"cta_value": message.text.strip()}).eq("id", message.from_user.id).execute()
+    except Exception: pass
     await message.answer("🎉 **Готово!**\n`/article` — статья\n`/help` — команды", parse_mode="Markdown")
     await state.clear()
 
@@ -738,10 +709,11 @@ async def gen_article(message):
 
     await message.answer("✍️ **Пишу...** 1-2 мин.", parse_mode="Markdown")
     article = ask_qwen(f"""Анализ: {analysis}
-SEO-статья: 1 ключ + 1 боль. Заголовок, вступление с болью, подзаголовки, 5-7 тыс знаков, мягкий призыв.
+SEO-статья: 1 ключ + 1 боль. Заголовок, вступление с болью, подзаголовки, списки, 5-7 тыс знаков, мягкий призыв.
 В конце: Title, Description, хэштеги, Slug.
-=== 📄 СТАТЬЯ ===
-=== 🏷 SEO ===""", max_tokens=1400)
+📄 СТАТЬЯ
+🏷 SEO
+Не используй ###. Ответ должен быть ПОЛНЫМ.""", max_tokens=1500)
 
     if article.startswith("⚠️"):
         await message.answer(f"⚠️ {article}")
@@ -760,17 +732,13 @@ async def adapt_vc(callback):
     await callback.message.answer("⏳ Адаптирую...")
     try:
         a = supabase.table("articles").select("*").eq("user_id", callback.from_user.id).order("id", desc=True).limit(1).execute()
-        if not a.data:
-            return
+        if not a.data: return
         orig = a.data[0]["content"]
         aid = a.data[0]["id"]
-    except Exception:
-        return
-    vc = ask_qwen(f"Адаптируй под vc.ru: {orig}\nКейс/факап. Тон: коллега. 7-12 тыс.", max_tokens=1400)
-    try:
-        supabase.table("articles").update({"vc_version": vc}).eq("id", aid).execute()
-    except Exception:
-        pass
+    except Exception: return
+    vc = ask_qwen(f"Адаптируй под vc.ru: {orig}\nКейс/факап. Тон: коллега. 7-12 тыс. Не используй ###.", max_tokens=1500)
+    try: supabase.table("articles").update({"vc_version": vc}).eq("id", aid).execute()
+    except Exception: pass
     if not vc.startswith("⚠️"):
         await send_long(callback.message, f"📰 **vc.ru:**\n\n{vc}")
     await callback.answer()
@@ -787,8 +755,7 @@ async def cmd_help(message):
 
 @dp.message(Command("admin"))
 async def cmd_admin(message):
-    if message.from_user.id != ADMIN_ID:
-        return
+    if message.from_user.id != ADMIN_ID: return
     try:
         u = supabase.table("users").select("id").execute()
         a = supabase.table("articles").select("id").execute()
