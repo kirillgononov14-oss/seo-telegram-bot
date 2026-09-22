@@ -1,7 +1,5 @@
 aiogram
-openai
 requests
-Pillow
 supabase
 beautifulsoup4
 lxml
