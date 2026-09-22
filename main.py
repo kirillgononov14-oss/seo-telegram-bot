@@ -5,7 +5,6 @@ import threading
 import asyncio
 import time
 import re
-import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command, CommandStart
@@ -32,7 +31,6 @@ ADMIN_ID = 1847007101
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Проверка переменных при старте
 for var_name, var_value in [("BOT_TOKEN", BOT_TOKEN), ("GROQ_API_KEY", GROQ_API_KEY), ("SUPABASE_URL", SUPABASE_URL), ("SUPABASE_KEY", SUPABASE_KEY)]:
     if not var_value:
         logger.error(f"❌ MISSING ENV VAR: {var_name}")
@@ -51,20 +49,29 @@ except Exception as e:
 
 BANNED_NICHES = ["обнал", "отмыв", "адалт", "18+", "порн", "оружие", "наркот", "взлом", "хакер"]
 
-# === ПРЯМЫЕ ЗАПРОСЫ К GROQ (без библиотеки!) ===
+# === ПРАВИЛЬНЫЕ МОДЕЛИ (из твоего Usage) ===
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 MODELS = [
-    "llama-3.1-8b-instant",
-    "llama-3.3-70b-versatile",
-    "qwen/qwen3-32b",
-    "gemma2-9b-it",
-    "llama3-8b-8192",
+    "qwen/qwen3.8-27b",          # ✅ Точно работает у тебя
+    "qwen/qwen3-235b-a22b",      # Запасная
+    "llama-3.3-70b-specdec",     # Запасная
 ]
 
+BASE_SYSTEM = """Ты — элитный SEO-стратег и контент-маркетолог с 15-летним опытом.
+СТРОГИЕ ПРАВИЛА:
+1. Пиши ТОЛЬКО на русском
+2. НЕ используй ### или ##
+3. Используй эмодзи для заголовков
+4. Выделяй важное **жирным**
+5. ОТВЕТ ДОЛЖЕН БЫТЬ ПОЛНЫМ
+6. НИКОГДА не задавай вопросов если не просят"""
+
+RECON_SYSTEM = BASE_SYSTEM + "\nЗАДАЧА: КРАТКАЯ разведка (максимум 800 слов). НЕ ЗАДАВАЙ ВОПРОСОВ."
+FINAL_ANALYSIS_SYSTEM = BASE_SYSTEM + "\nЗАДАЧА: ПОЛНЫЙ глубокий анализ. НЕ ЗАДАВАЙ ВОПРОСОВ."
+QUESTION_SYSTEM = BASE_SYSTEM + "\nЗАДАЧА: ОДИН вопрос для интервью. Только ОДИН вопрос, открытый. Без нумерации, без эмодзи. Максимум 150 слов."
+
 def groq_request(prompt, max_tokens=1200, system=None):
-    """Прямой запрос к Groq через requests. Надёжнее чем библиотека."""
-    sys_msg = system or "Ты — полезный ассистент. Отвечай на русском."
-    
+    sys_msg = system or BASE_SYSTEM
     for model in MODELS:
         try:
             logger.info(f"🤖 Groq: trying {model}...")
@@ -82,15 +89,12 @@ def groq_request(prompt, max_tokens=1200, system=None):
                 "temperature": 0.7,
             }
             r = requests.post(GROQ_URL, headers=headers, json=payload, timeout=120)
-            
             if r.status_code == 200:
                 data = r.json()
                 result = data["choices"][0]["message"]["content"]
                 if result and len(result.strip()) > 0:
                     logger.info(f"✅ Groq OK ({model}): {len(result)} chars")
                     return result
-                else:
-                    logger.warning(f"⚠️ Groq empty response ({model})")
             elif r.status_code == 429:
                 logger.warning(f"⚠️ Rate limit ({model}), waiting 5 sec...")
                 time.sleep(5)
@@ -103,23 +107,8 @@ def groq_request(prompt, max_tokens=1200, system=None):
         except Exception as e:
             logger.error(f"❌ Groq error ({model}): {type(e).__name__}: {e}")
             continue
-    
     logger.error("❌ ALL GROQ MODELS FAILED")
     return None
-
-# === ПРОМПТЫ ===
-BASE_SYSTEM = """Ты — элитный SEO-стратег и контент-маркетолог с 15-летним опытом.
-СТРОГИЕ ПРАВИЛА:
-1. Пиши ТОЛЬКО на русском
-2. НЕ используй ### или ##
-3. Используй эмодзи для заголовков
-4. Выделяй важное **жирным**
-5. ОТВЕТ ДОЛЖЕН БЫТЬ ПОЛНЫМ
-6. НИКОГДА не задавай вопросов если не просят"""
-
-RECON_SYSTEM = BASE_SYSTEM + "\nЗАДАЧА: КРАТКАЯ разведка (максимум 800 слов). НЕ ЗАДАВАЙ ВОПРОСОВ."
-FINAL_ANALYSIS_SYSTEM = BASE_SYSTEM + "\nЗАДАЧА: ПОЛНЫЙ глубокий анализ. НЕ ЗАдавай ВОПРОСОВ."
-QUESTION_SYSTEM = BASE_SYSTEM + "\nЗАДАЧА: ОДИН вопрос для интервью. Только ОДИН вопрос, открытый. Без нумерации, без эмодзи. Максимум 150 слов."
 
 def ask_qwen(prompt, max_tokens=1200, system=None):
     result = groq_request(prompt, max_tokens, system)
@@ -194,15 +183,15 @@ def heartbeat():
         time.sleep(60)
         logger.info("💓 HEARTBEAT: alive")
 
-# === ТЕСТ GROQ ПРИ СТАРТЕ ===
 def test_groq():
     logger.info("🧪 Testing Groq connection...")
     result = groq_request("Ответь одним словом: привет", max_tokens=10)
     if result:
         logger.info(f"✅ GROQ TEST PASSED: {result[:50]}")
+        return True
     else:
-        logger.error("❌ GROQ TEST FAILED! Check API key and limits")
-    return result is not None
+        logger.error("❌ GROQ TEST FAILED!")
+        return False
 
 # === SCRAPERAPI ===
 def scrape_with_api(url, premium=False, render=False, country_code="ru"):
@@ -360,7 +349,6 @@ def get_yandex_suggestions(kw):
     except Exception:
         return []
 
-# === SUPABASE ===
 def get_or_create_user(uid, username, fname):
     try:
         result = supabase.table("users").select("*").eq("id", uid).execute()
@@ -395,7 +383,6 @@ def log_usage(uid, action):
     except Exception:
         pass
 
-# === ОТПРАВКА ===
 async def send_long(message, text):
     MAX = 4000
     try:
@@ -415,7 +402,6 @@ async def send_long(message, text):
 def is_banned(text):
     return any(w in text.lower() for w in BANNED_NICHES)
 
-# === КОМАНДЫ ===
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     logger.info(f"🚀 /start from {message.from_user.id}")
@@ -470,11 +456,9 @@ async def cmd_continue_logic(message: types.Message, state: FSMContext):
     data = await state.get_data()
     qn = data.get("question_num", 1)
     history = data.get("history", [])
-    
     if not current_state or (qn == 1 and not history):
         await message.answer("🤔 Нет активного диалога. Нажми 🔄 Начать заново.", reply_markup=get_main_menu())
         return
-    
     if current_state == "Onboarding:gathering":
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="▶️ Продолжить", callback_data="continue_action")],
@@ -530,27 +514,21 @@ async def ask_next_interview_question(message: types.Message, state: FSMContext)
     history = data.get("history", [])
     qn = data.get("question_num", 1)
     pri = data.get("priority_service", "")
-    
     if qn >= 8:
         await finish_interview(message, state, history)
         return
-    
     hist = "\n".join([f"Q{i['q']}: {i['a']}" for i in history])
     pq = f"Ты задал {qn} вопросов. История:\n{hist}\n"
     if pri: pq += f"\nПриоритет: {pri}\n"
     pq += "\nЗадай ОДИН следующий вопрос. ТОЛЬКО вопрос."
-    
     nq = ask_qwen(pq, max_tokens=150, system=QUESTION_SYSTEM)
-    
     if not nq or nq.startswith("⚠️"):
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="continue_action")]])
         await message.answer("⚠️ Не удалось сгенерировать вопрос. Нажми кнопку.", reply_markup=kb)
         return
-    
     nq = nq.strip()
     for prefix in ["Вопрос:", "Q:", "q:", "В:", "**", "❓", "?\n", "\n"]:
         nq = nq.replace(prefix, "").strip()
-    
     await state.update_data(question_num=qn + 1)
     await message.answer(
         f"{progress_bar(qn)}\n❓ **Вопрос {qn} из 8:**\n{nq}\n\n"
@@ -565,20 +543,16 @@ async def live_interview(message: types.Message, state: FSMContext):
         await message.answer("👌 Пропускаю.", parse_mode="Markdown")
         await ask_next_interview_question(message, state)
         return
-    
     data = await state.get_data()
     history = data.get("history", [])
     qn = data.get("question_num", 1)
     src_req = data.get("source_requested", False)
-
     if qn == 1 and is_banned(message.text):
         await message.answer("❌ Не работаю с этой темой.", reply_markup=get_main_menu())
         await state.clear()
         return
-
     history.append({"q": qn, "a": message.text})
     save_answer(uid, f"Q{qn}", message.text)
-
     if qn == 1:
         check = ask_qwen(f'Клиент: "{message.text}"\nНесколько РАЗНЫХ услуг? Ответь "YES|у1|у2" или "NO"', max_tokens=100, system=QUESTION_SYSTEM)
         if check and check.startswith("YES|"):
@@ -589,7 +563,6 @@ async def live_interview(message: types.Message, state: FSMContext):
                 await message.answer("🎯 **Вижу несколько направлений:**\n" + "\n".join([f"• {s}" for s in services]) + "\n\nПо какой делаем анализ?", reply_markup=kb, parse_mode="Markdown")
                 await state.set_state(Onboarding.service_priority)
                 return
-
     if qn >= 4 and not src_req:
         await state.update_data(history=history, source_requested=True)
         await message.answer(
@@ -602,7 +575,6 @@ async def live_interview(message: types.Message, state: FSMContext):
         await state.set_state(Onboarding.source_link)
         await state.update_data(waiting_manual=False)
         return
-
     await ask_next_interview_question(message, state)
 
 @dp.callback_query(F.data.startswith("svc_"))
@@ -625,7 +597,6 @@ async def get_source(message: types.Message, state: FSMContext):
     data = await state.get_data()
     history = data.get("history", [])
     waiting_manual = data.get("waiting_manual", False)
-
     if waiting_manual:
         await message.answer("⏳ Изучаю текст...")
         src = message.text
@@ -639,25 +610,20 @@ async def get_source(message: types.Message, state: FSMContext):
         await state.set_state(Onboarding.gathering)
         await ask_next_interview_question(message, state)
         return
-
     answer = message.text.strip()
     save_answer(uid, "source_link", answer)
-
     if answer.lower() in ["нет", "нету", "-", "0", "нет источника"]:
         await message.answer("👌 Работаем без источника.", parse_mode="Markdown")
         await state.update_data(source_requested=True, source_data=None, waiting_manual=False)
         await state.set_state(Onboarding.gathering)
         await ask_next_interview_question(message, state)
         return
-
     urls = extract_urls(answer)
     if not urls:
         urls = [f"https://www.avito.ru/user/{answer}/shop"] if answer.isdigit() else [answer]
-
     await state.set_state(Onboarding.waiting_source_parsing)
     await state.update_data(urls_to_parse=urls)
     await message.answer(f"⏳ Нашёл {len(urls)} источник(ов). Изучаю (30-90 сек)...", parse_mode="Markdown")
-
     all_data = ""
     results = []
     for url in urls:
@@ -667,7 +633,6 @@ async def get_source(message: types.Message, state: FSMContext):
             all_data += f"\n=== {src_type}: {url} ===\n{src_text}\n"
         else:
             results.append(f"⚠️ **{src_type}** ({url}) — не открылся")
-
     results_text = "\n".join(results)
     if all_data:
         save_answer(uid, "source_data", all_data[:3000])
@@ -693,7 +658,6 @@ async def finish_interview(message, state, history):
     pri = data.get("priority_service", "")
     src = data.get("source_data", "")
     await message.answer("✅ **Интервью завершено!**\n⏳ Полный анализ (2-3 мин)...", parse_mode="Markdown")
-
     ht = "\n".join([f"Q{i['q']}: {i['a']}" for i in history])
     nq = pri if pri else (history[0]["a"] if history else "")
     competitors = search_competitors(nq[:80])
@@ -701,25 +665,19 @@ async def finish_interview(message, state, history):
     comp_text = "\n".join([f"- {c['title']}: {c['snippet']}" for c in competitors[:5]]) if competitors else "нет"
     sugg_text = ", ".join(suggestions[:10]) if suggestions else "пусто"
     src_sec = f"\n=== ИСТОЧНИКИ ===\n{src}\n" if src else ""
-
     analysis = ask_qwen(f"Интервью: {ht}{src_sec}\nПриоритет: {pri or 'нет'}\nКонкуренты: {comp_text}\nЯндекс: {sugg_text}\nПОЛНЫЙ АНАЛИЗ:\n🎯 КЛЮЧИ (15)\n💥 БОЛИ (10)\n⭐ УТП\n⚠️ МИНУСЫ", max_tokens=2500, system=FINAL_ANALYSIS_SYSTEM)
-
     if not analysis or analysis.startswith("⚠️"):
         await message.answer("⚠️ Ошибка анализа. Нажми ▶️ Продолжить.", reply_markup=get_main_menu())
         return
-
     plan = ask_qwen(f"Анализ: {analysis[:3000]}\nКонтент-план на 7 дней.", max_tokens=1500, system=FINAL_ANALYSIS_SYSTEM)
     guide = ask_qwen("Инструкция: публикация в Дзен. 5 шагов. Аналогия с магазином.", max_tokens=1200, system=FINAL_ANALYSIS_SYSTEM)
-
     save_research(uid, analysis + "\n\n" + plan, "", "", comp_text)
-
     await send_long(message, f"🎯 **ПОЛНЫЙ АНАЛИЗ:**\n{analysis}")
     await asyncio.sleep(1.5)
     if plan and not plan.startswith("⚠️"): await send_long(message, f"📅 **ПЛАН:**\n{plan}")
     await asyncio.sleep(1.5)
     if guide and not guide.startswith("⚠️"): await send_long(message, f"📚 **ДЗЕН:**\n{guide}")
     await asyncio.sleep(1)
-
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📸 Фото")], [KeyboardButton(text="⏭ Пропустить")]], resize_keyboard=True)
     await message.answer("📸 **Загрузить фото работ?**", reply_markup=kb, parse_mode="Markdown")
     await state.set_state(Onboarding.photos)
@@ -778,18 +736,14 @@ async def gen_article_logic(message):
     except Exception:
         await message.answer("Сначала пройди онбординг.", reply_markup=get_main_menu())
         return
-
     await message.answer("✍️ Пишу статью (1-2 мин)...", parse_mode="Markdown")
     article = ask_qwen(f"Анализ: {analysis}\nSEO-статья: 1 ключ + 1 боль. Заголовок, вступление, подзаголовки, 5-7 тыс знаков.\n📄 СТАТЬЯ\n🏷 SEO (Title, Description, хэштеги, Slug)", max_tokens=2500, system=FINAL_ANALYSIS_SYSTEM)
-
     if not article or article.startswith("⚠️"):
         await message.answer("⚠️ Ошибка генерации. Нажми ▶️ Продолжить.", reply_markup=get_main_menu())
         return
     save_article(uid, "статья", "боль", "статья", article)
     log_usage(uid, "article")
     await send_long(message, f"📄 **СТАТЬЯ:**\n{article}")
-    
-    # Картинка
     try:
         img_url = "https://image.pollinations.ai/prompt/" + requests.utils.quote("professional blog cover, modern minimal, no text") + "?width=1200&height=630"
         img_data = requests.get(img_url, timeout=60).content
@@ -798,14 +752,11 @@ async def gen_article_logic(message):
             await message.answer_photo(photo, caption="🖼 Обложка")
     except Exception:
         pass
-    
-    # Файл
     try:
         doc = BufferedInputFile(article.encode('utf-8'), filename="article.txt")
         await message.answer_document(doc, caption="💾 Скачать")
     except Exception:
         pass
-    
     await asyncio.sleep(1)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ vc.ru", callback_data="vc_yes"), InlineKeyboardButton(text="❌ Дзен", callback_data="vc_no")]
@@ -846,17 +797,19 @@ async def cmd_admin(message):
     except Exception as e:
         await message.answer(f"⚠️ {e}")
 
-# === ЗАПУСК ===
 async def main():
     logger.info("🚀 Starting bot...")
+    # Защита от дублей бота
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logger.warning(f"⚠️ delete_webhook: {e}")
+    await asyncio.sleep(2)
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
 if __name__ == "__main__":
     threading.Thread(target=start_health_server, daemon=True).start()
     threading.Thread(target=heartbeat, daemon=True).start()
-    
-    # Тест Groq при старте
     test_groq()
-    
     logger.info("✅ Threads started, running main...")
     asyncio.run(main())
