@@ -39,23 +39,42 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 BANNED_NICHES = ["обнал", "отмыв", "адалт", "18+", "порн", "оружие", "наркот", "взлом", "хакер"]
 
-SYSTEM_PROMPT = """Ты — элитный SEO-стратег и контент-маркетолог с 15-летним опытом.
-Работаешь как настоящий живой маркетолог на брифе.
+# === СИСТЕМНЫЙ ПРОМПТ (БАЗА) ===
+BASE_SYSTEM = """Ты — элитный SEO-стратег и контент-маркетолог с 15-летним опытом.
+Работаешь как настоящий живой маркетолог.
 
-ПРАВИЛА ФОРМАТИРОВАНИЯ:
-- НЕ используй символы ### или ##
-- Используй эмодзи для заголовков (🎯 📌 💥 ⭐ ⚠️ 📅)
-- Выделяй важное **жирным**
-- Пиши списками с тире или цифрами
-- Разделяй блоки пустой строкой
-- ВСЕГДА заканчивай ответ полностью, не обрывай на полуслове
+СТРОГИЕ ПРАВИЛА:
+1. Пиши ТОЛЬКО на русском языке
+2. НЕ используй символы ### или ##
+3. Используй эмодзи (🎯 📌 💥 ⭐ ⚠️ 📅) для заголовков
+4. Выделяй важное **жирным**
+5. ОТВЕТ ДОЛЖЕН БЫТЬ ПОЛНЫМ — никогда не обрывай
+6. НИКОГДА не задавай вопросы клиенту, если тебя об этом явно не попросили в задаче"""
 
-ПРИНЦИПЫ:
-1. Живое интервью: по одному вопросу, внимательно читай ответы
-2. Несколько услуг = разные ниши. Спроси приоритет
-3. Анализируй ТОЛЬКО реальные данные. Не выдумывай
-4. Статья = 1 ключ + 1 боль. Язык читателя, решай боль
-5. Всегда отвечай на русском языке"""
+# === ПРОМПТ ДЛЯ РАЗВЕДКИ (анализ источника, БЕЗ вопросов) ===
+RECON_SYSTEM = BASE_SYSTEM + """
+
+ЗАДАЧА: Сделай КРАТКУЮ разведку бизнеса клиента на основе присланных данных.
+ВАЖНО: НЕ ЗАДАВАЙ ВОПРОСОВ КЛИЕНТУ. Только анализ.
+Отвечай коротко и по делу (максимум 1000 слов)."""
+
+# === ПРОМПТ ДЛЯ ПОЛНОГО АНАЛИЗА (в конце интервью) ===
+FINAL_ANALYSIS_SYSTEM = BASE_SYSTEM + """
+
+ЗАДАЧА: Сделай ПОЛНЫЙ глубокий анализ ниши клиента.
+ВАЖНО: НЕ ЗАДАВАЙ ВОПРОСОВ КЛИЕНТУ. Только анализ с разделами.
+Будь детальным но не повторяйся."""
+
+# === ПРОМПТ ДЛЯ ГЕНЕРАЦИИ ВОПРОСА ===
+QUESTION_SYSTEM = BASE_SYSTEM + """
+
+ЗАДАЧА: Сгенерируй ОДИН следующий вопрос для интервью.
+ПРАВИЛА:
+- Только ОДИН вопрос, без вступлений
+- Вопрос должен быть открытым (не да/нет)
+- Вопрос должен быть конкретным и продвигающим диалог
+- Без нумерации, без префиксов вроде "Вопрос:"
+- Без эмодзи"""
 
 class Onboarding(StatesGroup):
     gathering = State()
@@ -105,15 +124,9 @@ def scrape_with_api(url, premium=False, render=False, country_code="ru"):
     if not SCRAPER_API_KEY:
         logger.error("❌ SCRAPER_API_KEY не задан!")
         return None
-    params = {
-        "api_key": SCRAPER_API_KEY,
-        "url": url,
-        "country_code": country_code,
-    }
-    if premium:
-        params["premium"] = "true"
-    if render:
-        params["render"] = "true"
+    params = {"api_key": SCRAPER_API_KEY, "url": url, "country_code": country_code}
+    if premium: params["premium"] = "true"
+    if render: params["render"] = "true"
     try:
         logger.info(f"🌐 Scraping {url} (premium={premium}, render={render})...")
         r = requests.get("http://api.scraperapi.com", params=params, timeout=90)
@@ -174,17 +187,15 @@ def extract_telegram_channel(url):
 def extract_avito(url):
     try:
         if not url.startswith("http"): url = "https://" + url
-        # Пробуем 3 варианта
         variants = [
-            (url, True, True),           # Оригинал + premium + render
-            (url.replace("www.avito.ru", "m.avito.ru"), True, True),  # Мобильная
-            (url, True, False),           # Premium без render
+            (url, True, True),
+            (url.replace("www.avito.ru", "m.avito.ru"), True, True),
+            (url, True, False),
         ]
         for variant_url, prem, rend in variants:
             html = scrape_with_api(variant_url, premium=prem, render=rend)
             if not html: continue
             soup = BeautifulSoup(html, "lxml")
-            # Ищем описание
             parts = []
             for tag in soup.find_all(["h1", "h2", "h3"]):
                 t = tag.get_text(strip=True)
@@ -197,7 +208,6 @@ def extract_avito(url):
             if len(result) > 200:
                 logger.info(f"✅ Avito: {len(result)} chars")
                 return result[:5000]
-            # Пробуем весь текст
             for s in soup(["script", "style"]): s.decompose()
             full = soup.get_text(separator="\n", strip=True)
             if len(full) > 500:
@@ -212,11 +222,10 @@ def extract_vk_group(url):
     try:
         vk = url.replace("https://vk.com/", "").replace("https://vk.ru/", "")
         vk = vk.replace("vk.com/", "").replace("vk.ru/", "").strip("/").split("/")[0]
-        # Пробуем 3 варианта
         variants = [
-            f"https://m.vk.com/{vk}",     # Мобильная (проще парсится)
-            f"https://vk.com/{vk}",        # Обычная
-            f"https://m.vk.com/{vk}?act=info",  # Информация
+            f"https://m.vk.com/{vk}",
+            f"https://vk.com/{vk}",
+            f"https://m.vk.com/{vk}?act=info",
         ]
         for variant_url in variants:
             html = scrape_with_api(variant_url, premium=True, render=True)
@@ -227,7 +236,6 @@ def extract_vk_group(url):
                 t = p.get_text(strip=True)
                 if 40 < len(t) < 2000 and not any(skip in t.lower() for skip in ["cookie", "войти", "зарегистрироваться", "браузер"]):
                     posts.append(t)
-            # Убираем дубли
             unique = []
             seen = set()
             for p in posts:
@@ -245,7 +253,6 @@ def extract_vk_group(url):
                 if len(result) > 200:
                     logger.info(f"✅ VK: {len(result)} chars, {len(posts)} posts")
                     return result[:5000]
-            # Весь текст
             for s in soup(["script", "style"]): s.decompose()
             full = soup.get_text(separator="\n", strip=True)
             if len(full) > 500:
@@ -312,7 +319,7 @@ def log_usage(uid, action):
 
 # === QWEN ===
 def ask_qwen(prompt, max_tokens=1200, system=None):
-    sys_msg = system or SYSTEM_PROMPT
+    sys_msg = system or BASE_SYSTEM
     for attempt in range(3):
         try:
             logger.info(f"🤖 Qwen attempt {attempt+1}, max_tokens={max_tokens}...")
@@ -322,12 +329,11 @@ def ask_qwen(prompt, max_tokens=1200, system=None):
                 max_tokens=max_tokens, temperature=0.7, timeout=120
             )
             result = r.choices[0].message.content
-            # Проверяем что ответ не оборвался
             finish = r.choices[0].finish_reason
-            if finish == "length":
-                logger.warning(f"⚠️ Qwen response truncated (hit max_tokens={max_tokens})")
-                result += "\n\n[...анализ продолжается в следующем сообщении]"
             logger.info(f"✅ Qwen: {len(result)} chars, finish={finish}")
+            if finish == "length":
+                logger.warning(f"⚠️ Response TRUNCATED! Hit max_tokens={max_tokens}")
+                result += "\n\n[Ответ был обрезан, но основная информация передана]"
             return result
         except Exception as e:
             logger.error(f"❌ Qwen fail {attempt+1}: {e}")
@@ -371,15 +377,66 @@ async def cmd_start(message: types.Message, state: FSMContext):
 async def cmd_ping(message: types.Message):
     await message.answer(f"✅ Бот жив! {int(time.time())}")
 
+# === ГЕНЕРАЦИЯ СЛЕДУЮЩЕГО ВОПРОСА (отдельная функция) ===
+async def ask_next_interview_question(message: types.Message, state: FSMContext):
+    """Задаёт СЛЕДУЮЩИЙ вопрос интервью. Всегда по одному."""
+    data = await state.get_data()
+    history = data.get("history", [])
+    qn = data.get("question_num", 1)
+    pri = data.get("priority_service", "")
+    
+    # Если вопросов уже 8+ — завершаем интервью
+    if qn >= 8:
+        await finish_interview(message, state, history)
+        return
+    
+    hist = "\n".join([f"Q{i['q']}: {i['a']}" for i in history])
+    pq = f"""Ты уже задал {qn} вопросов клиенту. Вот история:
+
+{hist}
+"""
+    if pri:
+        pq += f"\nПриоритетная услуга клиента: {pri}\n"
+    
+    pq += """
+Задай ОДИН следующий конкретный вопрос (открытый, не да/нет), который поможет:
+- понять боли клиентов глубже
+- узнать конкурентные преимущества
+- получить реальные кейсы
+
+ВАЖНО:
+- Напиши ТОЛЬКО вопрос
+- Без вступлений и комментариев
+- Без нумерации
+- Без эмодзи
+- Без префиксов типа "Вопрос:" или "Q" """
+    
+    nq = ask_qwen(pq, max_tokens=150, system=QUESTION_SYSTEM)
+    
+    if nq.startswith("⚠️"):
+        await message.answer(f"⚠️ {nq}\nПопробуй ещё раз или /start")
+        return
+    
+    # Очищаем вопрос от лишнего
+    nq = nq.strip()
+    # Убираем возможные префиксы
+    for prefix in ["Вопрос:", "Q:", "q:", "В:", "**", "❓", "?\n"]:
+        nq = nq.replace(prefix, "").strip()
+    
+    logger.info(f"✅ Generated question {qn+1}: {nq[:50]}...")
+    await state.update_data(history=history, question_num=qn + 1)
+    await message.answer(f"❓ **Вопрос {qn + 1}:**\n{nq}", parse_mode="Markdown")
+
 # === ИНТЕРВЬЮ ===
 @dp.message(Onboarding.gathering)
 async def live_interview(message: types.Message, state: FSMContext):
     uid = message.from_user.id
-    logger.info(f"💬 Response from {uid}: {message.text[:50]}...")
     data = await state.get_data()
     history = data.get("history", [])
     qn = data.get("question_num", 1)
     src_req = data.get("source_requested", False)
+    
+    logger.info(f"💬 Response Q{qn} from {uid}: {message.text[:50]}...")
 
     if qn == 1 and is_banned(message.text):
         await message.answer("❌ Не работаю с этой темой. /start")
@@ -389,8 +446,9 @@ async def live_interview(message: types.Message, state: FSMContext):
     history.append({"q": qn, "a": message.text})
     save_answer(uid, f"Q{qn}", message.text)
 
+    # После 1-го вопроса проверяем несколько услуг
     if qn == 1:
-        check = ask_qwen(f'Клиент: "{message.text}"\nНесколько РАЗНЫХ услуг? Ответь "YES|у1|у2" или "NO"', max_tokens=100)
+        check = ask_qwen(f'Клиент: "{message.text}"\nНесколько РАЗНЫХ услуг? Ответь "YES|у1|у2" или "NO"', max_tokens=100, system=QUESTION_SYSTEM)
         if check.startswith("YES|"):
             services = [s.strip() for s in check.split("|")[1:] if s.strip()]
             if services:
@@ -404,38 +462,22 @@ async def live_interview(message: types.Message, state: FSMContext):
                 await state.set_state(Onboarding.service_priority)
                 return
 
+    # После 4-го вопроса просим источник (если ещё не просили)
     if qn >= 4 and not src_req:
         await state.update_data(history=history, question_num=qn + 1, source_requested=True)
         await message.answer(
             "✅ **Уже многое понял!**\n\n"
-            "🔗 Пришли ссылки на источники (можно несколько):\n"
+            "🔗 Пришли ссылки на источники (можно несколько в одном сообщении):\n"
             "• 🌐 Сайт\n• ✈️ Telegram-канал\n• 📱 Авито\n• 💬 ВКонтакте\n\n"
-            "Изучу каждый. Нет источника — напиши **«нет»**.",
+            "Изучу каждый сам. Если ничего нет — напиши **«нет»**.",
             parse_mode="Markdown"
         )
         await state.set_state(Onboarding.source_link)
         await state.update_data(waiting_manual=False)
         return
 
-    if qn >= 8:
-        await finish_interview(message, state, history)
-        return
-
-    await ask_and_send_next_question(message, state, history, qn, data)
-
-async def ask_and_send_next_question(message, state, history, qn, data):
-    """Задаёт следующий вопрос интервью"""
-    hist = "\n".join([f"Q{i['q']}: {i['a']}" for i in history])
-    pri = data.get("priority_service", "")
-    pq = f"История ({qn} вопросов):\n{hist}\n"
-    if pri: pq += f"Приоритет: {pri}\n"
-    pq += "\nЗадай следующий конкретный вопрос (открытый, не да/нет). Напиши ТОЛЬКО вопрос, без вступлений и без символов ###."
-    nq = ask_qwen(pq, max_tokens=200)
-    if nq.startswith("⚠️"):
-        await message.answer(f"⚠️ {nq}\nПопробуй ещё раз или /start")
-        return
-    await state.update_data(history=history, question_num=qn + 1)
-    await message.answer(f"❓ **Вопрос {qn + 1}:**\n{nq}", parse_mode="Markdown")
+    # Задаём следующий вопрос (один за раз!)
+    await ask_next_interview_question(message, state)
 
 @dp.callback_query(F.data.startswith("svc_"))
 async def service_chosen(callback: types.CallbackQuery, state: FSMContext):
@@ -448,10 +490,7 @@ async def service_chosen(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer(f"✅ **Акцент на:** {pri}", parse_mode="Markdown")
     await state.update_data(priority_service=pri, history=history, question_num=2)
     await state.set_state(Onboarding.gathering)
-    ht = "\n".join([f"Q{i['q']}: {i['a']}" for i in history])
-    nq = ask_qwen(f"Клиент выбрал: {pri}\nБизнес: {ht}\nЗадай вопрос о страхах клиентов по этой услуге. ТОЛЬКО вопрос.", max_tokens=200)
-    if not nq.startswith("⚠️"):
-        await callback.message.answer(f"❓ **Вопрос 2:**\n{nq}", parse_mode="Markdown")
+    await ask_next_interview_question(callback.message, state)
     await callback.answer()
 
 # === ИСТОЧНИКИ ===
@@ -462,49 +501,54 @@ async def get_source(message: types.Message, state: FSMContext):
     history = data.get("history", [])
     waiting_manual = data.get("waiting_manual", False)
 
-    # Если клиент прислал текст вручную (запасной вариант)
+    # Запасной вариант: клиент прислал текст
     if waiting_manual:
-        await message.answer("⏳ Изучаю текст...")
+        await message.answer("⏳ Изучаю текст (30-60 сек)...")
         src = message.text
         save_answer(uid, "source_data", src[:2000])
+        
         ht = "\n".join([f"Q{i['q']}: {i['a']}" for i in history])
         pri = data.get("priority_service", "")
+        
+        # КРАТКАЯ разведка — БЕЗ вопросов
         analysis = ask_qwen(f"""Клиент прислал информацию о бизнесе:
 {src}
 
-Из интервью:
+Из интервью известно:
 {ht}
 Приоритет: {pri or 'не указан'}
 
-Проанализируй ЧЕСТНО (только на основе данных, не выдумывай):
-📌 Сильные стороны (3-4 пункта)
-📌 Слабые места (2-3 пункта)
-📌 Стиль общения (2-3 предложения)
-📌 Что использовать в статьях (3-4 идеи)
+Сделай КРАТКУЮ разведку (не больше 600 слов):
+📌 **Сильные стороны** (3 пункта, коротко)
+📌 **Слабые места** (2-3 пункта, коротко)
+📌 **Стиль общения** (1-2 предложения)
+📌 **Идеи для статей** (2-3 идеи, одной строкой каждая)
 
-В конце задай 2-3 конкретных уточняющих вопроса клиенту.
-Не используй символы ###. Пиши обычным текстом с эмодзи.""", max_tokens=1500)
-
+НЕ ЗАДАВАЙ ВОПРОСОВ КЛИЕНТУ. Только краткий анализ.""", max_tokens=1500, system=RECON_SYSTEM)
+        
         if not analysis.startswith("⚠️"):
-            await send_long(message, f"✅ **Изучил!**\n\n{analysis}")
-        else:
-            await message.answer(f"⚠️ {analysis}")
-
-        await state.update_data(history=history, question_num=data.get("question_num", 5), source_requested=True, source_data=src[:2000], waiting_manual=False)
+            await send_long(message, f"📊 **Краткая разведка:**\n\n{analysis}")
+        
+        await state.update_data(
+            history=history, 
+            question_num=data.get("question_num", 5), 
+            source_requested=True, 
+            source_data=src[:2000], 
+            waiting_manual=False
+        )
         await state.set_state(Onboarding.gathering)
-        # ВАЖНО: продолжаем интервью — задаём следующий вопрос
-        await ask_and_send_next_question(message, state, history, data.get("question_num", 5), data)
+        await message.answer("Продолжаем интервью. Готов ответить на следующий вопрос?", parse_mode="Markdown")
+        await ask_next_interview_question(message, state)
         return
 
     answer = message.text.strip()
     save_answer(uid, "source_link", answer)
 
-    # Если "нет"
     if answer.lower() in ["нет", "нету", "-", "0", "нет источника", "отсутствует"]:
         await message.answer("👌 Работаем без источника.", parse_mode="Markdown")
         await state.update_data(source_requested=True, source_data=None, waiting_manual=False)
         await state.set_state(Onboarding.gathering)
-        await ask_and_send_next_question(message, state, history, data.get("question_num", 5), data)
+        await ask_next_interview_question(message, state)
         return
 
     urls = extract_urls(answer)
@@ -534,6 +578,7 @@ async def get_source(message: types.Message, state: FSMContext):
         ht = "\n".join([f"Q{i['q']}: {i['a']}" for i in history])
         pri = data.get("priority_service", "")
 
+        # КРАТКАЯ разведка — БЕЗ вопросов внутри
         analysis = ask_qwen(f"""Данные из источников клиента:
 {all_data[:6000]}
 
@@ -541,18 +586,16 @@ async def get_source(message: types.Message, state: FSMContext):
 {ht}
 Приоритет: {pri or 'не указан'}
 
-Проанализируй ЧЕСТНО (только на основе данных, не выдумывай):
-📌 Сильные стороны (3-4 пункта)
-📌 Слабые места, мешающие продажам (2-3 пункта)
-📌 Стиль общения (2-3 предложения)
-📌 Что использовать в статьях (3-4 идеи)
+Сделай КРАТКУЮ разведку (не больше 600 слов):
+📌 **Сильные стороны** (3 пункта, коротко)
+📌 **Слабые места** (2-3 пункта, коротко)
+📌 **Стиль общения** (1-2 предложения)
+📌 **Идеи для статей** (2-3 идеи, одной строкой каждая)
 
-В конце задай 2-3 конкретных уточняющих вопроса клиенту.
-Не используй символы ###. Пиши обычным текстом с эмодзи и **жирным**.
-ОТВЕТ ДОЛЖЕН БЫТЬ ПОЛНЫМ — не обрывай на полуслове.""", max_tokens=1500)
+ВАЖНО: НЕ ЗАДАВАЙ ВОПРОСОВ КЛИЕНТУ. Только анализ.""", max_tokens=1500, system=RECON_SYSTEM)
 
         if not analysis.startswith("⚠️"):
-            await send_long(message, f"📊 **Результаты изучения:**\n{results_text}\n\n{analysis}")
+            await send_long(message, f"📊 **Результаты изучения:**\n{results_text}\n\n**Краткая разведка:**\n{analysis}")
         else:
             await send_long(message, f"📊 **Результаты:**\n{results_text}\n\n{analysis}")
 
@@ -563,6 +606,10 @@ async def get_source(message: types.Message, state: FSMContext):
             source_data=all_data[:3000],
             waiting_manual=False
         )
+        await state.set_state(Onboarding.gathering)
+        # Продолжаем интервью ОДНИМ вопросом
+        await message.answer("Отлично, продолжаем интервью.", parse_mode="Markdown")
+        await ask_next_interview_question(message, state)
     else:
         await message.answer(
             f"📊 **Результаты:**\n{results_text}\n\n"
@@ -573,22 +620,13 @@ async def get_source(message: types.Message, state: FSMContext):
         await state.update_data(waiting_manual=True)
         return
 
-    # ВАЖНО: продолжаем интервью — задаём следующий вопрос
-    await state.set_state(Onboarding.gathering)
-    data = await state.get_data()
-    qn = data.get("question_num", 5)
-    if qn >= 8:
-        await finish_interview(message, state, history)
-    else:
-        await ask_and_send_next_question(message, state, history, qn, data)
-
-# === ЗАВЕРШЕНИЕ ===
+# === ЗАВЕРШЕНИЕ (ПОЛНЫЙ АНАЛИЗ) ===
 async def finish_interview(message, state, history):
     uid = message.from_user.id
     data = await state.get_data()
     pri = data.get("priority_service", "")
     src = data.get("source_data", "")
-    await message.answer("✅ **Интервью завершено!**\n⏳ Анализирую... **1-2 мин**.", parse_mode="Markdown")
+    await message.answer("✅ **Интервью завершено!**\n⏳ Делаю **полный анализ ниши**... 2-3 минуты.", parse_mode="Markdown")
 
     ht = "\n".join([f"Q{i['q']}: {i['a']}" for i in history])
     nq = pri if pri else (history[0]["a"] if history else "")
@@ -596,50 +634,65 @@ async def finish_interview(message, state, history):
     suggestions = get_yandex_suggestions(nq[:30])
     comp_text = "\n".join([f"- {c['title']}: {c['snippet']}" for c in competitors[:5]]) if competitors else "нет"
     sugg_text = ", ".join(suggestions[:10]) if suggestions else "пусто"
-    src_sec = f"\n=== ИСТОЧНИК ===\n{src}\n" if src else ""
+    src_sec = f"\n=== ДАННЫЕ ИЗ ИСТОЧНИКОВ ===\n{src}\n" if src else ""
 
-    analysis = ask_qwen(f"""Интервью: {ht}{src_sec}
+    # ПОЛНЫЙ анализ — большой max_tokens
+    analysis = ask_qwen(f"""Интервью:
+{ht}{src_sec}
+
 Приоритет: {pri or 'нет'}
-Конкуренты: {comp_text}
+Конкуренты:
+{comp_text}
 Подсказки Яндекса: {sugg_text}
 
-Проведи анализ:
-1. 15 ключевых запросов
-2. 10 болей ЦА
-3. УТП (3-4 предложения)
-4. Минусы позиционирования
+Сделай ПОЛНЫЙ глубокий анализ ниши с разделами:
 
-Оформи блоками:
-🎯 КЛЮЧИ
-💥 БОЛИ
-⭐ УТП
-⚠️ МИНУСЫ
+🎯 **КЛЮЧИ** (15 запросов, по одному на строку)
+💥 **БОЛИ** (10 конкретных болей ЦА, по одной на строку)
+⭐ **УТП** (3-4 предложения, чем клиент лучше конкурентов)
+⚠️ **МИНУСЫ** (2-3 слабых места в позиционировании)
 
-Не используй ###. Ответ должен быть ПОЛНЫМ.""", max_tokens=1500)
+НЕ ЗАДАВАЙ ВОПРОСОВ КЛИЕНТУ. Только анализ.""", max_tokens=2500, system=FINAL_ANALYSIS_SYSTEM)
 
     if analysis.startswith("⚠️"):
         await message.answer(f"⚠️ {analysis}")
         return
 
-    plan = ask_qwen(f"""Анализ: {analysis}
-Контент-план на 7 дней для Дзен. 1 статья = 1 ключ + 1 боль.
-Укажи: ключ, боль, тип, день, ЧАС публикации, длину.
-📅 ПЛАН
-Не используй ###.""", max_tokens=1200)
+    # Контент-план (отдельный запрос)
+    plan = ask_qwen(f"""На основе анализа:
+{analysis[:3000]}
 
+Составь **контент-план на 7 дней** для Дзен.
+1 статья = 1 ключ + 1 боль.
+Для каждой: ключ, боль, тип, день недели, ЧАС публикации, длина.
+
+Формат:
+📅 **ПЛАН НА 7 ДНЕЙ**
+1. [день] ...
+2. [день] ...
+
+НЕ ЗАДАВАЙ ВОПРОСОВ.""", max_tokens=1500, system=FINAL_ANALYSIS_SYSTEM)
+
+    # Инструкция
     guide = ask_qwen("""Инструкция для чайника: как опубликовать SEO-статью в Дзен для трафика из Яндекса и Гугла.
-5 шагов. Объясни Title, Description, H1 через аналогию с магазином.
-Не используй ###.""", max_tokens=1000)
+5 простых шагов. Объясни Title, Description, H1, alt-текст через аналогию с магазином.
+Формат:
+📚 **ПУБЛИКАЦИЯ В ДЗЕН**
+Шаг 1...
+Шаг 2...
+
+НЕ ЗАДАВАЙ ВОПРОСОВ.""", max_tokens=1200, system=FINAL_ANALYSIS_SYSTEM)
 
     save_research(uid, analysis + "\n\n" + plan, "", "", comp_text)
 
-    await send_long(message, f"🎯 **АНАЛИЗ НИШИ:**\n\n{analysis}")
-    await asyncio.sleep(1)
+    # Отправляем по частям с задержкой
+    await send_long(message, f"🎯 **ПОЛНЫЙ АНАЛИЗ ТВОЕЙ НИШИ:**\n\n{analysis}")
+    await asyncio.sleep(1.5)
     if not plan.startswith("⚠️"):
-        await send_long(message, f"📅 **ПЛАН:**\n\n{plan}")
-    await asyncio.sleep(1)
+        await send_long(message, f"📅 **КОНТЕНТ-ПЛАН:**\n\n{plan}")
+    await asyncio.sleep(1.5)
     if not guide.startswith("⚠️"):
-        await send_long(message, f"📚 **ДЗЕН:**\n\n{guide}")
+        await send_long(message, f"📚 **КАК ПУБЛИКОВАТЬ В ДЗЕН:**\n\n{guide}")
     await asyncio.sleep(1)
 
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📸 Фото")], [KeyboardButton(text="⏭ Пропустить")]], resize_keyboard=True)
@@ -707,20 +760,35 @@ async def gen_article(message):
         await message.answer("Сначала /start")
         return
 
-    await message.answer("✍️ **Пишу...** 1-2 мин.", parse_mode="Markdown")
+    await message.answer("✍️ **Пишу статью...** 1-2 мин.", parse_mode="Markdown")
     article = ask_qwen(f"""Анализ: {analysis}
-SEO-статья: 1 ключ + 1 боль. Заголовок, вступление с болью, подзаголовки, списки, 5-7 тыс знаков, мягкий призыв.
-В конце: Title, Description, хэштеги, Slug.
-📄 СТАТЬЯ
-🏷 SEO
-Не используй ###. Ответ должен быть ПОЛНЫМ.""", max_tokens=1500)
+
+Напиши SEO-статью по правилу "1 ключ + 1 боль".
+Выбери самую сильную связку ключ+боль из анализа.
+
+СТРУКТУРА:
+📄 **СТАТЬЯ**
+- Цепляющий заголовок с ключом
+- Вступление с болью (2-3 абзаца)
+- Подзаголовки, списки
+- 5-7 тыс. знаков
+- Цифры, кейсы, шаги, ошибки
+- Мягкий призыв в конце
+
+🏷 **SEO-ПАКЕТ**
+- **Title:** (до 60 символов)
+- **Description:** (до 160 символов)
+- **Хэштеги:** 2-3 штуки
+- **Slug:** ЧПУ-ссылка латиницей
+
+НЕ ЗАДАВАЙ ВОПРОСОВ. Полный ответ.""", max_tokens=2500, system=FINAL_ANALYSIS_SYSTEM)
 
     if article.startswith("⚠️"):
         await message.answer(f"⚠️ {article}")
         return
     save_article(uid, "статья", "боль", "статья", article)
     log_usage(uid, "article")
-    await send_long(message, f"📄 **СТАТЬЯ:**\n\n{article}")
+    await send_long(message, f"📄 **СТАТЬЯ ГОТОВА:**\n\n{article}")
     await asyncio.sleep(1)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ vc.ru", callback_data="vc_yes"), InlineKeyboardButton(text="❌ Дзен", callback_data="vc_no")]
@@ -736,7 +804,15 @@ async def adapt_vc(callback):
         orig = a.data[0]["content"]
         aid = a.data[0]["id"]
     except Exception: return
-    vc = ask_qwen(f"Адаптируй под vc.ru: {orig}\nКейс/факап. Тон: коллега. 7-12 тыс. Не используй ###.", max_tokens=1500)
+    vc = ask_qwen(f"""Адаптируй под vc.ru:
+{orig}
+
+Угол: кейс / факап / внутренняя кухня
+Тон: коллега делится опытом
+Длина: 7-12 тыс. знаков
+Без хэштегов и прямой рекламы
+
+НЕ ЗАДАВАЙ ВОПРОСОВ.""", max_tokens=2500, system=FINAL_ANALYSIS_SYSTEM)
     try: supabase.table("articles").update({"vc_version": vc}).eq("id", aid).execute()
     except Exception: pass
     if not vc.startswith("⚠️"):
@@ -745,7 +821,7 @@ async def adapt_vc(callback):
 
 @dp.callback_query(F.data == "vc_no")
 async def skip_vc(callback):
-    await callback.message.answer("👌 Дзен.")
+    await callback.message.answer("👌 Только Дзен.")
     await callback.answer()
 
 # === HELP / ADMIN ===
