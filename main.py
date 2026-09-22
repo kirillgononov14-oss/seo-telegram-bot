@@ -26,6 +26,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")
+SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY")  # НОВЫЙ КЛЮЧ
 ADMIN_ID = 1847007101
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -38,15 +39,6 @@ groq_client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 BANNED_NICHES = ["обнал", "отмыв", "адалт", "18+", "порн", "оружие", "наркот", "взлом", "хакер"]
-
-# Несколько User-Agent для маскировки под разные браузеры
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
-]
 
 SYSTEM_PROMPT = """Ты — элитный SEO-стратег и контент-маркетолог с 15-летним опытом.
 ПРИНЦИПЫ:
@@ -100,6 +92,51 @@ def heartbeat():
         time.sleep(60)
         logger.info("💓 HEARTBEAT: alive")
 
+# === ГЛАВНАЯ ФУНКЦИЯ ПАРСИНГА ЧЕРЕЗ SCRAPERAPI ===
+def scrape_with_api(url, premium=False, country_code="ru"):
+    """
+    Парсит любой сайт через ScraperAPI.
+    premium=True — для сложных сайтов (Авито, ВК) с защитой от ботов
+    """
+    if not SCRAPER_API_KEY:
+        logger.error("❌ SCRAPER_API_KEY не задан!")
+        return None
+    
+    params = {
+        "api_key": SCRAPER_API_KEY,
+        "url": url,
+    }
+    
+    # Для сложных сайтов используем premium + локацию РФ
+    if premium:
+        params["premium"] = "true"
+        params["country_code"] = country_code
+    
+    try:
+        logger.info(f"🌐 Scraping {url} (premium={premium})...")
+        r = requests.get(
+            "http://api.scraperapi.com",
+            params=params,
+            timeout=60
+        )
+        
+        if r.status_code == 200:
+            # Проверяем что не получили капчу или пустую страницу
+            if len(r.text) < 200:
+                logger.warning(f"⚠️ Слишком короткий ответ для {url}: {len(r.text)} chars")
+                return None
+            if "captcha" in r.text.lower() or "robot" in r.text.lower():
+                logger.warning(f"⚠️ Капча на {url}")
+                return None
+            logger.info(f"✅ Scraped {url}: {len(r.text)} chars")
+            return r.text
+        else:
+            logger.error(f"❌ ScraperAPI error {r.status_code} for {url}")
+            return None
+    except Exception as e:
+        logger.error(f"❌ Scrape error for {url}: {e}")
+        return None
+
 # === ИЗВЛЕЧЕНИЕ ССЫЛОК ===
 def extract_urls(text):
     return re.findall(r'https?://[^\s,;]+', text)
@@ -126,175 +163,153 @@ def parse_source(url):
     else:
         return extract_site_text(url), "Сайт"
 
-# === УЛУЧШЕННЫЕ ПАРСЕРЫ ===
-def _request_with_retry(url, timeout=45, is_mobile=False):
-    """Делает несколько попыток с разными User-Agent"""
-    for i, ua in enumerate(USER_AGENTS[:3]):  # 3 попытки
-        try:
-            headers = {
-                "User-Agent": ua,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5",
-                "Accept-Encoding": "gzip, deflate",
-                "Connection": "keep-alive",
-                "Upgrade-Insecure-Requests": "1",
-                "Cache-Control": "max-age=0"
-            }
-            r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
-            r.encoding = "utf-8"
-            if r.status_code == 200:
-                logger.info(f"✅ HTTP 200 на попытке {i+1} для {url}")
-                return r
-            logger.warning(f"⚠️ Status {r.status_code} для {url}, попытка {i+1}")
-        except requests.exceptions.Timeout:
-            logger.warning(f"⏱️ Таймаут на попытке {i+1} для {url}")
-        except Exception as e:
-            logger.warning(f"⚠️ Ошибка на попытке {i+1}: {type(e).__name__}")
-        time.sleep(1)  # Пауза перед следующей попыткой
-    return None
-
+# === ПАРСЕРЫ ЧЕРЕЗ SCRAPERAPI ===
 def extract_site_text(url):
     try:
         if not url.startswith("http"):
             url = "https://" + url
         
-        # Пробуем с www и без
-        r = _request_with_retry(url, timeout=45)
-        if not r:
-            # Пробуем альтернативный вариант
-            alt_url = url.replace("https://", "http://") if url.startswith("https://") else url.replace("http://", "https://")
-            r = _request_with_retry(alt_url, timeout=45)
-        
-        if not r:
+        # Обычный сайт — без premium (экономим лимит)
+        html = scrape_with_api(url, premium=False)
+        if not html:
             return None
         
-        soup = BeautifulSoup(r.text, "lxml")
+        soup = BeautifulSoup(html, "lxml")
         for s in soup(["script", "style", "nav", "footer", "header", "noscript"]):
             s.decompose()
         text = soup.get_text(separator="\n", strip=True)
-        logger.info(f"✅ Site: {len(text)} chars from {url}")
-        return text[:5000] if len(text) > 100 else None
+        
+        if len(text) < 100:
+            return None
+        
+        logger.info(f"✅ Site extracted: {len(text)} chars")
+        return text[:5000]
     except Exception as e:
-        logger.error(f"❌ Site error {url}: {e}")
+        logger.error(f"❌ Site parse error: {e}")
         return None
 
 def extract_telegram_channel(url):
     try:
         ch = url.replace("https://t.me/", "").replace("t.me/", "").strip("/").split("/")[0]
         public_url = f"https://t.me/s/{ch}"
-        r = _request_with_retry(public_url, timeout=30)
-        if not r:
+        
+        html = scrape_with_api(public_url, premium=False)
+        if not html:
             return None
-        soup = BeautifulSoup(r.text, "lxml")
+        
+        soup = BeautifulSoup(html, "lxml")
         posts = [p.get_text(strip=True) for p in soup.find_all("div", class_="tgme_widget_message_text") if p.get_text(strip=True)]
+        
         if not posts:
             return None
-        logger.info(f"✅ TG: {len(posts)} posts")
+        
+        logger.info(f"✅ TG extracted: {len(posts)} posts")
         return "\n\n".join(posts[:10])[:5000]
     except Exception as e:
-        logger.error(f"❌ TG error: {e}")
+        logger.error(f"❌ TG parse error: {e}")
         return None
 
 def extract_avito(url):
-    """Парсит Авито разными способами"""
     try:
         if not url.startswith("http"):
             url = "https://" + url
         
-        # Способ 1: обычная версия
-        r = _request_with_retry(url, timeout=45)
-        if r:
-            soup = BeautifulSoup(r.text, "lxml")
-            # Ищем описание объявления
-            description = ""
-            for tag in soup.find_all(["div", "p", "span"]):
-                text = tag.get_text(strip=True)
-                if len(text) > 30 and any(c in text for c in ["руб", "₽", "дом", "м²", "участок"]):
-                    description += text + "\n"
-            
-            if len(description) > 200:
-                logger.info(f"✅ Avito: {len(description)} chars (v1)")
-                return description[:5000]
+        # Авито — ОБЯЗАТЕЛЬНО premium + РФ (иначе не работает)
+        html = scrape_with_api(url, premium=True, country_code="ru")
+        if not html:
+            return None
         
-        # Способ 2: мобильная версия
-        mobile_url = url.replace("www.avito.ru", "m.avito.ru")
-        r = _request_with_retry(mobile_url, timeout=45)
-        if r:
-            soup = BeautifulSoup(r.text, "lxml")
-            text = soup.get_text(separator="\n", strip=True)
-            if len(text) > 300:
-                logger.info(f"✅ Avito mobile: {len(text)} chars")
-                return text[:5000]
+        soup = BeautifulSoup(html, "lxml")
         
-        # Способ 3: ищем через JSON в HTML
-        if r:
-            text = r.text
-            # Авито иногда вставляет данные в JSON
-            if "description" in text.lower() and len(text) > 1000:
-                logger.info(f"✅ Avito via page analysis")
-                soup = BeautifulSoup(text, "lxml")
-                clean_text = soup.get_text(separator="\n", strip=True)
-                if len(clean_text) > 200:
-                    return clean_text[:5000]
+        # Собираем весь текст со страницы
+        description = []
         
-        return None
+        # Заголовок
+        for tag in soup.find_all(["h1", "h2", "h3"]):
+            text = tag.get_text(strip=True)
+            if text and len(text) > 5:
+                description.append(text)
+        
+        # Описание объявления
+        for tag in soup.find_all(["div", "p", "span"]):
+            text = tag.get_text(strip=True)
+            if len(text) > 20 and any(c in text.lower() for c in ["руб", "₽", "дом", "м²", "участок", "этаж", "площадь", "комнат"]):
+                if text not in description:
+                    description.append(text)
+        
+        result = "\n".join(description)
+        
+        if len(result) < 200:
+            # Пробуем достать весь видимый текст
+            for s in soup(["script", "style"]):
+                s.decompose()
+            result = soup.get_text(separator="\n", strip=True)
+        
+        if len(result) < 200:
+            return None
+        
+        logger.info(f"✅ Avito extracted: {len(result)} chars")
+        return result[:5000]
     except Exception as e:
-        logger.error(f"❌ Avito error: {e}")
+        logger.error(f"❌ Avito parse error: {e}")
         return None
 
 def extract_vk_group(url):
-    """Парсит ВКонтакте"""
     try:
         vk = url.replace("https://vk.com/", "").replace("https://vk.ru/", "")
         vk = vk.replace("vk.com/", "").replace("vk.ru/", "").strip("/").split("/")[0]
         
-        # Способ 1: мобильная версия (легче парсится)
-        mobile_url = f"https://m.vk.com/{vk}"
-        r = _request_with_retry(mobile_url, timeout=45)
-        if r:
-            soup = BeautifulSoup(r.text, "lxml")
-            posts = []
-            for p in soup.find_all(["div", "p"]):
-                text = p.get_text(strip=True)
-                if len(text) > 30 and len(text) < 1000:
-                    posts.append(text)
-            
-            if posts:
-                # Берём уникальные
-                unique_posts = []
-                seen = set()
-                for p in posts:
-                    if p not in seen:
-                        seen.add(p)
-                        unique_posts.append(p)
-                posts = unique_posts[:15]
-            
-            desc = ""
-            for d in soup.find_all(["div", "p"], class_=["group_info", "page_info", "group_description", "info"]):
-                desc += d.get_text(strip=True) + "\n"
-            
-            if posts or desc:
-                result = ""
-                if desc:
-                    result += "ОПИСАНИЕ:\n" + desc + "\n\n"
-                if posts:
-                    result += "ПОСТЫ:\n" + "\n---\n".join(posts[:10])
-                logger.info(f"✅ VK mobile: {len(result)} chars, {len(posts)} posts")
-                return result[:5000]
-        
-        # Способ 2: публичная страница
+        # ВК — ОБЯЗАТЕЛЬНО premium + РФ
         public_url = f"https://vk.com/{vk}"
-        r = _request_with_retry(public_url, timeout=45)
-        if r:
-            soup = BeautifulSoup(r.text, "lxml")
-            text = soup.get_text(separator="\n", strip=True)
-            if len(text) > 500:
-                logger.info(f"✅ VK public: {len(text)} chars")
-                return text[:5000]
+        html = scrape_with_api(public_url, premium=True, country_code="ru")
+        if not html:
+            return None
         
-        return None
+        soup = BeautifulSoup(html, "lxml")
+        
+        posts = []
+        # Ищем посты
+        for p in soup.find_all(["div", "p"]):
+            text = p.get_text(strip=True)
+            if len(text) > 40 and len(text) < 2000:
+                # Фильтруем мусорные элементы
+                if not any(skip in text.lower() for skip in ["cookie", "браузер", "войти", "зарегистрироваться"]):
+                    posts.append(text)
+        
+        # Убираем дубли
+        unique_posts = []
+        seen = set()
+        for p in posts:
+            if p not in seen:
+                seen.add(p)
+                unique_posts.append(p)
+        posts = unique_posts[:15]
+        
+        # Описание группы
+        desc = ""
+        for d in soup.find_all(["div", "p"], class_=["group_info", "page_info", "group_description", "info"]):
+            desc += d.get_text(strip=True) + "\n"
+        
+        if not posts and not desc:
+            # Пробуем достать весь текст
+            for s in soup(["script", "style"]):
+                s.decompose()
+            full_text = soup.get_text(separator="\n", strip=True)
+            if len(full_text) > 500:
+                logger.info(f"✅ VK full text: {len(full_text)} chars")
+                return full_text[:5000]
+            return None
+        
+        result = ""
+        if desc:
+            result += "ОПИСАНИЕ ГРУППЫ:\n" + desc + "\n\n"
+        if posts:
+            result += "ПОСЛЕДНИЕ ПОСТЫ:\n" + "\n---\n".join(posts[:10])
+        
+        logger.info(f"✅ VK extracted: {len(result)} chars, {len(posts)} posts")
+        return result[:5000]
     except Exception as e:
-        logger.error(f"❌ VK error: {e}")
+        logger.error(f"❌ VK parse error: {e}")
         return None
 
 def search_competitors(q, max_results=5):
@@ -310,7 +325,7 @@ def get_yandex_suggestions(kw):
     try:
         r = requests.get("https://suggest.yandex.net/suggest-ff.cgi",
                          params={"part": kw, "lang": "ru", "v": "3"},
-                         headers={"User-Agent": USER_AGENTS[0]}, timeout=10)
+                         timeout=10)
         data = r.json()
         return data[1] if isinstance(data, list) and len(data) > 1 else []
     except Exception as e:
@@ -540,7 +555,7 @@ async def get_source(message: types.Message, state: FSMContext):
         else:
             urls = [answer]
 
-    await message.answer(f"⏳ **Нашёл {len(urls)} источник(ов). Изучаю каждый (это может занять 30-60 сек)...**", parse_mode="Markdown")
+    await message.answer(f"⏳ **Нашёл {len(urls)} источник(ов). Изучаю каждый (30-90 сек)...**", parse_mode="Markdown")
 
     all_data = ""
     results = []
@@ -551,7 +566,7 @@ async def get_source(message: types.Message, state: FSMContext):
             results.append(f"✅ **{src_type}** — изучен!")
             all_data += f"\n=== {src_type}: {url} ===\n{src_text}\n"
         else:
-            results.append(f"⚠️ **{src_type}** ({url}) — не открылся (сайт блокирует зарубежные серверы)")
+            results.append(f"⚠️ **{src_type}** ({url}) — не открылся")
 
     results_text = "\n".join(results)
 
@@ -577,16 +592,10 @@ async def get_source(message: types.Message, state: FSMContext):
             await send_long(message, f"📊 **Результаты:**\n{results_text}\n\n{analysis}")
         await state.update_data(history=history, question_num=data.get("question_num", 4), source_requested=True, source_data=all_data[:3000], waiting_manual=False)
     else:
-        # Ни один не открылся — честно объясняем причину и просим текст
         await message.answer(
-            f"📊 **Результаты изучения:**\n{results_text}\n\n"
-            f"⚠️ **Почему так:** мой сервер находится в Германии, "
-            f"а многие российские сайты (Авито, ВК, некоторые сайты) "
-            f"блокируют зарубежные запросы или отвечают слишком медленно.\n\n"
-            f"💡 **Что делать:** просто **скопируй текст** со своих источников "
-            f"(описание, цены, услуги) и пришли мне одним сообщением — "
-            f"я его изучу и сделаю такой же качественный анализ.\n\n"
-            f"Это займёт 1 минуту, и результат будет не хуже.",
+            f"📊 **Результаты:**\n{results_text}\n\n"
+            f"Не смог открыть автоматически. "
+            f"Пришли **текстом**: описание, цены, услуги.",
             parse_mode="Markdown"
         )
         await state.update_data(waiting_manual=True)
