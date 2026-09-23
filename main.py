@@ -21,7 +21,7 @@ from aiogram.types import (
 from supabase import create_client, Client
 from bs4 import BeautifulSoup
 
-# ИСПРАВЛЕННЫЙ ИМПОРТ ДЛЯ DUCKDUCKGO SEARCH
+# Импорты для поиска
 try:
     from ddgs import DDGS
 except ImportError:
@@ -59,187 +59,103 @@ except Exception as e:
 
 BANNED_NICHES = ["обнал", "отмыв", "адалт", "18+", "порн", "оружие", "наркот", "взлом", "хакер"]
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODELS = ["qwen/qwen3.8-27b"] 
+MODELS = ["llama-3.3-70b-versatile"] # Более надежная модель чем qwen для сложных задач
 
 DAILY_LIMIT = 3 
-GLOBAL_TIMEOUT_SEC = 300 # 5 минут макс на одну статью
+GLOBAL_TIMEOUT_SEC = 300 
+
+# Глобальный словарь статусов для быстрого доступа командой /status
+ACTIVE_TASKS: Dict[int, asyncio.Task] = {}
+TASK_STATUS: Dict[int, str] = {} 
 
 # =========================
-# DATABASE HELPERS (SAFE)
+# DATABASE HELPERS
 # =========================
 
 def register_user_safe(user_id: int, username: str = "", first_name: str = "") -> bool:
     try:
-        data = {
-            "id": user_id,
-            "username": username or "",
-            "first_name": first_name or ""
-        }
+        data = {"id": user_id, "username": username or "", "first_name": first_name or ""}
         res = supabase.table("users").upsert(data).execute()
-        if res.data:
-            logger.info(f"🆕 User registered/updated: {user_id}")
-            return True
-        else:
-            check = supabase.table("users").select("*").eq("id", user_id).execute()
-            if check.data:
-                logger.info(f"✅ User already exists: {user_id}")
-                return True
-        return False
+        return True if res.data else False
     except Exception as e:
-        logger.error(f"❌ CRITICAL DB ERROR registering user {user_id}: {e}")
+        logger.error(f"DB Register Error: {e}")
         return False
 
 # =========================
 # PROMPTS ENGINE
 # =========================
 
-BASE_SYSTEM = """Ты — элитный SEO-стратег и контент-маркетолог уровня Top-Tier агентств РФ.
-Твоя цель: привести горячий трафик клиенту, используя данные о рынке и психологию ЦА.
-
-ПРАВИЛА:
-1. Пиши ТОЛЬКО на русском.
-2. НЕ используй ### или ##. Используй эмодзи и **жирный**.
-3. Язык статей: ГОВОРИ НА ЯЗЫКЕ ЦЕЛЕВОЙ АУДИТОРИИ (ЦА). 
-   - Никаких сложных терминов. Простые предложения. Живые примеры.
-   - ЦА должна чувствовать: "Это про меня!".
-4. Анализ конкурентов: Ищи их слабые места и превращай их в преимущества нашего клиента.
-5. Структура ответа четкая, без воды."""
+BASE_SYSTEM = """Ты — элитный SEO-стратег. Пиши на русском. Без Markdown заголовков (#). Используй эмодзи.
+Говори языком ЦА (простые слова, живые примеры)."""
 
 SPY_SYSTEM = BASE_SYSTEM + """
-
-ЗАДАЧА: Шпионаж за конкурентами.
-ВХОДНЫЕ ДАННЫЕ: Ниша, список сайтов конкурентов.
-
-СТРУКТУРА ОТВЕТА:
-1. COMPETITORS_ANALYSIS: Слабые места ТОП-3 конкурентов.
-2. TARGET_AUDIENCE_PAIN_POINTS: 5 главных болей ЦА (на их языке).
-3. TONE_OF_VOICE: Описание стиля речи ЦА.
-4. ARTICLE_IDEAS_QUEUE: Список из 10+ идей статей.
-   Каждая идея: {topic, pain_point, competitor_weakness_to_hammer, relevance_score}
-
-ВАЖНО: Выдай результат структурировано."""
+ЗАДАЧА: Анализ рынка.
+ВЫВЕДИ JSON:
+{
+  "niche_keyword": "...",
+  "competitors_weaknesses": ["...", "..."],
+  "audience_pains": ["...", "..."],
+  "article_ideas": [
+    {"topic": "...", "pain_point": "...", "weakness_to_hammer": "...", "score": 10.0}
+  ]
+}"""
 
 WRITER_DZEN_SYSTEM = BASE_SYSTEM + """
-
-ЗАДАЧА: Написать статью для Яндекс.Дзен.
-ТРЕБОВАНИЯ:
-1. Объем: 5-7 тыс. знаков.
-2. Заголовок: Цепляющий, но честный.
-3. Лид: Начать с боли ("Знакомо ли вам чувство...").
-4. Основная часть: Решаем проблему. Мягко сравниваем с рынком.
-5. CTA: Мягкая рекомендация.
-6. SEO-блок в конце: Title, Description, Slug, Хэштеги.
-
-ВАЖНО: Текст должен быть таким, чтобы ЦА поверила эксперту."""
+ЗАДАЧА: Статья для Дзен. 5-7к знаков. Структура: Боль -> Решение -> Сравнение с рынком -> CTA. SEO блок в конце."""
 
 WRITER_VC_SYSTEM = BASE_SYSTEM + """
-
-ЗАДАЧА: Адаптировать статью под vc.ru.
-ТРЕБОВАНИЯ:
-1. Угол подачи: Кейс, факап, внутренняя кухня бизнеса.
-2. Тон: Коллега делится опытом. Без рекламной шелухи.
-3. Структура: Проблема -> Попытки решения -> Ошибка/Инсайт -> Решение -> Результат.
-4. Длина: 7-12 тыс. знаков.
-5. Запрещено: Хэштеги, прямые ссылки на покупку. Только ценность.
-
-ВАЖНО: Читатели vc.ru ценят искренность и технические детали."""
+ЗАДАЧА: Адаптация под VC.RU. Стиль кейса/факапа. Без рекламы. Только инсайды."""
 
 TEASER_SYSTEM = BASE_SYSTEM + """
+ЗАДАЧА: Тизер для TG/МАХ. 300-500 знаков. Интрига, но без спойлеров."""
 
-ЗАДАЧА: Написать короткий тизер для Telegram/МАХ.
-ТРЕБОВАНИЯ:
-1. Длина: 300-500 знаков.
-2. Цель: Зацепить вниманием, но НЕ раскрывать суть.
-3. Формат: Эмоциональный крючок + Интрига + Призыв кликнуть.
-
-ВАЖНО: Не спойлерь решение. Продай любопытство."""
-
-IMAGE_GEN_SYSTEM = BASE_SYSTEM + """
-
-ЗАДАЧА: Создать промпт для нейросети для генерации обложки.
-Ответь только английским промптом. Стиль: Профессиональная фотография, высокое разрешение."""
-
-# --- ВОССТАНОВЛЕННАЯ ПЕРЕМЕННАЯ ДЛЯ ЗАГОЛОВКОВ ---
 TITLE_GEN_SYSTEM = BASE_SYSTEM + """
-
-ЗАДАЧА: Придумать 3 варианта заголовка для статьи.
-1. [A] Кликбейтный (вызывает сильное любопытство, но честный).
-2. [B] Экспертный (решает конкретную проблему, вызывает доверие).
-3. [C] Вопросительный (цепляет боль напрямую).
-
-Формат вывода:
+ЗАДАЧА: 3 заголовка.
+A: Кликбейт.
+B: Экспертный.
+C: Вопросительный.
+Формат:
 A: ...
 B: ...
 C: ..."""
 
-# =========================
-# HELPER FUNCTIONS
-# =========================
-
-def groq_request(prompt: str, max_tokens: int = 1200, system: Optional[str] = None, timeout: int = 60) -> Optional[str]:
-    sys_msg = system or BASE_SYSTEM
-    last_error = None
-
-    for attempt in range(2):
-        for model in MODELS:
-            try:
-                headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-                payload = {
-                    "model": model,
-                    "messages": [{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt[:15000]}],
-                    "max_tokens": max_tokens,
-                    "temperature": 0.7,
-                }
-                r = requests.post(GROQ_URL, headers=headers, json=payload, timeout=timeout)
-                
-                if r.status_code == 200:
-                    data = r.json()
-                    result = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    if result and result.strip():
-                        return result.strip()
-                elif r.status_code == 429:
-                    time.sleep(3)
-                    continue
-                else:
-                    logger.error(f"❌ Groq {r.status_code}: {r.text[:200]}")
-                    
-            except Exception as e:
-                logger.error(f"❌ Groq error: {e}")
-                continue
-        
-        if attempt == 0:
-            time.sleep(2)
-            
-    return None
-
-async def agroq(prompt: str, max_tokens: int = 1200, system: Optional[str] = None, timeout: int = 60) -> Optional[str]:
-    try:
-        return await asyncio.wait_for(asyncio.to_thread(groq_request, prompt, max_tokens, system, timeout), timeout=timeout + 15)
-    except:
-        return None
-
-async def run_sync(func: Callable, *args, timeout: int = 30, default: Any = None) -> Any:
-    try:
-        return await asyncio.wait_for(asyncio.to_thread(func, *args), timeout=timeout)
-    except:
-        return default
+IMAGE_GEN_SYSTEM = BASE_SYSTEM + """
+ЗАДАЧА: Промпт для Midjourney/Stable Diffusion на английском. Realistic photography."""
 
 # =========================
-# PARSING & SPYING ENGINE WITH REPORTING
+# NETWORK & PARSING HELPERS
 # =========================
+
+def normalize_vk_url(url: str) -> str:
+    """Приводит vk.ru и другие варианты к m.vk.com для лучшего парсинга"""
+    u = url.lower()
+    if "vk.com" in u:
+        return u.replace("vk.com", "m.vk.com")
+    if "vk.ru" in u:
+        return u.replace("vk.ru", "m.vk.com")
+    return u
 
 def scrape_with_api(url: str, premium: bool = False, render: bool = False) -> Optional[str]:
-    if not SCRAPER_API_KEY: return None
-    params = {"api_key": SCRAPER_API_KEY, "url": url, "country_code": "ru"}
+    if not SCRAPER_API_KEY: 
+        logger.warning("No Scraper API Key")
+        return None
+    
+    # Нормализация URL специально для VK
+    final_url = url
+    if "vk." in url:
+        final_url = normalize_vk_url(url)
+
+    params = {"api_key": SCRAPER_API_KEY, "url": final_url, "country_code": "ru"}
     if premium: params["premium"] = "true"
     if render: params["render"] = "true"
     
     try:
-        r = requests.get("http://api.scraperapi.com", params=params, timeout=75)
+        r = requests.get("http://api.scraperapi.com", params=params, timeout=60)
         if r.status_code == 200 and len(r.text) > 200:
             return r.text
         return None
-    except:
+    except Exception as e:
+        logger.error(f"Scrape error {url}: {e}")
         return None
 
 def extract_urls(text: str) -> list:
@@ -251,55 +167,34 @@ def detect_source_type(url: str) -> str:
     if "vk.com" in u or "vk.ru" in u: return "vk"
     if "t.me/" in u: return "telegram"
     if "max.ru" in u or "messenger.max.ru" in u: return "max"
-    if "instagram" in u: return "instagram"
     return "site"
 
-def parse_generic_site(url: str) -> tuple[Optional[str], str]:
-    html = scrape_with_api(url, premium=False, render=True)
-    if not html:
-        return None, "⚠️ Не удалось открыть сайт (таймаут или блокировка)."
-    
+def parse_content(html: str) -> str:
+    if not html: return ""
     soup = BeautifulSoup(html, "lxml")
     for s in soup(["script", "style", "nav", "footer", "header", "noscript"]):
         s.decompose()
-    
     main_content = soup.find("main") or soup.find("article") or soup.body
-    if not main_content:
-        return None, "⚠️ Сайт открылся, но основной контент не найден."
-    
+    if not main_content: return ""
     text = main_content.get_text(separator="\n", strip=True)
-    length = len(text)
-    
-    if length < 100:
-        return text, f"ℹ️ Сайт открыт, но текста очень мало ({length} зн.). Возможно, JS-рендеринг."
-        
-    return text[:4000], f"✅ Сайт изучен ({length} зн. контента)."
+    return text[:4000] if len(text) > 100 else ""
 
-def find_competitors(niche_query: str, top_n: int = 5) -> List[Dict]:
-    competitors = []
+async def agroq(prompt: str, max_tokens: int = 1200, system: Optional[str] = None, timeout: int = 60) -> Optional[str]:
+    sys_msg = system or BASE_SYSTEM
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": MODELS[0],
+        "messages": [{"role": "system", "content": sys_msg}, {"role": "user", "content": prompt[:15000]}],
+        "max_tokens": max_tokens,
+        "temperature": 0.7,
+    }
     try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(f"{niche_query} цены отзывы сайт", region="ru-ru", max_results=top_n))
-            for r in results:
-                url = r.get("href", "")
-                title = r.get("title", "")
-                snippet = r.get("body", "")
-                if url and "wikipedia" not in url and "youtube" not in url:
-                    competitors.append({"url": url, "title": title, "snippet": snippet})
+        r = await asyncio.to_thread(requests.post, GROQ_URL, headers=headers, json=payload, timeout=timeout)
+        if r.status_code == 200:
+            return r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
     except Exception as e:
-        logger.error(f"❌ Competitor search error: {e}")
-    return competitors
-
-def analyze_competitor_data(client_data: str, competitor_list: List[Dict]) -> str:
-    comp_texts = []
-    for i, comp in enumerate(competitor_list[:3]):
-        site_text = parse_generic_site(comp['url'])[0]
-        if site_text:
-            comp_texts.append(f"КОНКУРЕНТ {i+1} ({comp['title']}):\n{site_text[:1500]}")
-        else:
-            comp_texts.append(f"КОНКУРЕНТ {i+1} ({comp['title']}):\nСниппет: {comp['snippet']}")
-            
-    return "\n\n".join(comp_texts)
+        logger.error(f"Groq Async Error: {e}")
+    return None
 
 # =========================
 # STATE MACHINE
@@ -314,193 +209,235 @@ class OnboardingStates(StatesGroup):
     interview_q4 = State()      
     interview_q5 = State()      
     photo_setup = State()       
-    analyzing = State()         
     dashboard = State()         
     editing_article = State()   
 
 # =========================
-# BACKGROUND WORKERS
+# WORKERS (BACKGROUND JOBS)
 # =========================
 
-ACTIVE_TASKS: Dict[int, asyncio.Task] = {}
-TASK_STATUS: Dict[int, str] = {} 
-
-async def cancel_task(uid: int):
-    task = ACTIVE_TASKS.pop(uid, None)
-    TASK_STATUS.pop(uid, None)
-    if task and not task.done():
-        task.cancel()
-
-async def schedule_task(uid: int, func: Callable, *args, **kwargs):
-    await cancel_task(uid)
-    task = asyncio.create_task(func(uid, *args, **kwargs))
-    ACTIVE_TASKS[uid] = task
-    TASK_STATUS[uid] = "Started"
-    return task
-
 async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_data: dict):
-    TASK_STATUS[chat_id] = "Spying..."
+    TASK_STATUS[chat_id] = "🕵️♂️ Изучаю источники..."
     
-    user_check = supabase.table("users").select("id").eq("id", chat_id).execute()
-    if not user_check.data:
-        logger.error(f"❌ USER MISSING IN DB during spy work: {chat_id}")
-        await bot.send_message(chat_id, "❌ Критическая ошибка: Пользователь не найден в базе. Напиши /start заново.")
-        TASK_STATUS[chat_id] = "Error: No User"
-        return
-
-    await bot.send_message(chat_id, "🕵️♂️ **Запускаю глубокий шпионаж...**\nИзучаю конкурентов, анализирую боли ЦА и формирую стратегию.\nЭто займет 2-3 минуты.", disable_notification=True)
-    
-    client_raw_data = ""
-    parsing_report_lines = [] 
-    
-    if mode == "pilot":
-        links = input_data.get("links", [])
-        for link in links:
-            stype = detect_source_type(link)
-            status_msg = ""
-            content = ""
-            
-            if stype == "site":
-                content, status_msg = parse_generic_site(link)
-                if content:
-                    client_raw_data += f"\n=== SITE: {link} ===\n{content}\n"
-                parsing_report_lines.append(f"🌐 Сайт: {status_msg}")
-                
-            elif stype == "avito":
-                txt = scrape_with_api(link, premium=True, render=True)
-                if txt:
-                     soup = BeautifulSoup(txt, "lxml")
-                     clean = soup.get_text(separator="\n", strip=True)[:2000]
-                     if len(clean) > 100:
-                         client_raw_data += f"\n=== AVITO: {link} ===\n{clean}\n"
-                         parsing_report_lines.append(f"✈️ Авито: ✅ Объявление прочитано ({len(clean)} зн.)")
-                     else:
-                         parsing_report_lines.append(f"✈️ Авито: ⚠️ Мало данных ({len(clean)} зн.), возможно закрытое объявление.")
-                else:
-                    parsing_report_lines.append(f"✈️ Авито: ❌ Не удалось открыть страницу.")
-                    
-            elif stype == "vk":
-                 vk_url = link.replace("vk.com", "m.vk.com").replace("vk.ru", "m.vk.com")
-                 txt = scrape_with_api(vk_url, premium=True, render=True)
-                 if txt:
-                     soup = BeautifulSoup(txt, "lxml")
-                     clean = soup.get_text(separator="\n", strip=True)[:2000]
-                     if len(clean) > 100:
-                         client_raw_data += f"\n=== VK: {link} ===\n{clean}\n"
-                         parsing_report_lines.append(f"💬 ВК: ✅ Группа изучена ({len(clean)} зн.)")
-                     else:
-                         parsing_report_lines.append(f"💬 ВК: ⚠️ Открылась заглушка или вход. Данные минимальны.")
-                 else:
-                    parsing_report_lines.append(f"💬 ВК: ❌ Блокировка или ошибка сети.")
-                    
-            elif stype == "telegram":
-                 ch = link.split("/")[-1]
-                 pub_link = f"https://t.me/s/{ch}"
-                 txt = scrape_with_api(pub_link, premium=False, render=False)
-                 if txt:
-                     soup = BeautifulSoup(txt, "lxml")
-                     posts = [p.get_text(strip=True) for p in soup.find_all("div", class_="tgme_widget_message_text")]
-                     joined_posts = "\n".join(posts[:5])
-                     if len(joined_posts) > 50:
-                         client_raw_data += f"\n=== TELEGRAM: {link} ===\n{joined_posts[:2000]}\n"
-                         parsing_report_lines.append(f"📢 TG: ✅ Канал прочитан ({len(joined_posts)} зн.)")
-                     else:
-                         parsing_report_lines.append(f"📢 TG: ️ Публичная версия недоступна или канал пуст.")
-                 else:
-                    parsing_report_lines.append(f"📢 TG: ❌ Не удалось получить доступ к t.me/s/")
-                    
-            elif stype == "max":
-                 parsing_report_lines.append(f"📱 МАХ: ℹ️ Автоматический парсинг МАХ пока ограничен API. Буду использовать общие знания ниши.") 
-    
-    if parsing_report_lines:
-        report_text = "📊 **Отчет по твоим источникам:**\n\n" + "\n".join(parsing_report_lines)
-        await bot.send_message(chat_id, report_text, disable_notification=True)
-
-    if not client_raw_data:
-        client_raw_data = input_data.get("description", "Нет данных с сайтов.")
-
-    niche_keyword = input_data.get("keyword_guess", "")
-    if not niche_keyword:
-        desc = input_data.get("description", "")
-        niche_def = await agroq(f"Определи основное ключевое слово для SEO по этому описанию бизнеса (только слово, без точек):\n{desc}", max_tokens=20, system=BASE_SYSTEM)
-        niche_keyword = niche_def.strip().lower() if niche_def else "услуги"
-
-    competitors = find_competitors(niche_keyword)
-    comp_analysis_text = analyze_competitor_data(client_raw_data, competitors)
-
-    spy_prompt = f"""
-ДАННЫЕ КЛИЕНТА:
-{client_raw_data[:6000]}
-
-ИНФО О КОНКУРЕНТАХ (ТОП-3):
-{comp_analysis_text[:4000]}
-
-КЛЮЧЕВОЙ ЗАПРОС НИШИ: {niche_keyword}
-
-ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ (Интервью/Описание):
-{input_data.get('description', '')}
-
-Выполни глубокий стратегический анализ согласно инструкции SPY_SYSTEM.
-Особое внимание удели языку ЦА и слабым местам конкурентов.
-"""
-
-    spy_report = await agroq(spy_prompt, max_tokens=3000, system=SPY_SYSTEM, timeout=120)
-
-    if not spy_report:
-        await bot.send_message(chat_id, "⚠️ Ошибка анализа. Попробуй позже.", reply_markup=get_menu())
-        TASK_STATUS[chat_id] = "Error: Analysis Failed"
-        return
-
     try:
+        # 1. Парсинг данных клиента
+        client_raw_data = ""
+        parsing_report_lines = [] 
+        
+        if mode == "pilot":
+            links = input_data.get("links", [])
+            for link in links:
+                stype = detect_source_type(link)
+                content = ""
+                
+                if stype == "site":
+                    html = await asyncio.to_thread(scrape_with_api, link, False, True)
+                    content = parse_content(html)
+                    status = "✅ Сайт изучен" if content else "⚠️ Пусто/Ошибка"
+                    parsing_report_lines.append(f"🌐 Сайт: {status} ({len(content)} зн.)")
+                    
+                elif stype == "avito":
+                    html = await asyncio.to_thread(scrape_with_api, link, True, True)
+                    content = parse_content(html)
+                    status = "✅ Объявление прочитано" if content else "⚠️ Мало данных"
+                    parsing_report_lines.append(f"✈️ Авито: {status} ({len(content)} зн.)")
+                    
+                elif stype == "vk":
+                    # Специальная обработка VK через нормализацию
+                    html = await asyncio.to_thread(scrape_with_api, link, True, True)
+                    content = parse_content(html)
+                    status = "✅ Группа изучена" if content else "❌ Блокировка/VK требует вход"
+                    parsing_report_lines.append(f"💬 ВК: {status} ({len(content)} зн.)")
+                    
+                elif stype == "telegram":
+                    ch = link.split("/")[-1]
+                    pub_link = f"https://t.me/s/{ch}"
+                    html = await asyncio.to_thread(scrape_with_api, pub_link, False, False)
+                    soup = BeautifulSoup(html or "", "lxml")
+                    posts = [p.get_text(strip=True) for p in soup.find_all("div", class_="tgme_widget_message_text")]
+                    content = "\n".join(posts[:5])
+                    status = "✅ Канал прочитан" if content else "⚠️ Публичная версия недоступна"
+                    parsing_report_lines.append(f"📢 TG: {status} ({len(content)} зн.)")
+                
+                if content:
+                    client_raw_data += f"\n=== SOURCE [{stype.upper()}]: {link} ===\n{content}\n"
+
+        # Отправляем отчет пользователю сразу, чтобы он видел прогресс
+        if parsing_report_lines:
+            report_text = "📊 **Отчет по твоим источникам:**\n\n" + "\n".join(parsing_report_lines)
+            await bot.send_message(chat_id, report_text)
+        
+        if not client_raw_data:
+            client_raw_data = input_data.get("description", "Нет данных.")
+
+        TASK_STATUS[chat_id] = "🧠 Анализирую рынок и конкурентов..."
+        
+        # 2. Поиск конкурентов
+        niche_guess = input_data.get("keyword_guess", "")
+        if not niche_guess:
+            # Быстрый запрос на определение ниши
+            niche_def = await agroq(f"Определи одно ключевое слово для SEO бизнеса:\n{client_raw_data[:1000]}", max_tokens=20, system=BASE_SYSTEM)
+            niche_guess = niche_def.strip().lower() if niche_def else "услуги"
+
+        competitors = []
+        try:
+            with DDGS() as ddgs:
+                results = list(ddgs.text(f"{niche_guess} цены отзывы сайт", region="ru-ru", max_results=3))
+                for r in results:
+                    if r.get('href'):
+                        competitors.append({"url": r['href'], "title": r.get('title', ''), "snippet": r.get('body', '')})
+        except: pass
+
+        comp_analysis_text = ""
+        for i, comp in enumerate(competitors[:2]): # Берем топ-2 для скорости
+            c_html = await asyncio.to_thread(scrape_with_api, comp['url'], False, True)
+            c_content = parse_content(c_html)
+            comp_analysis_text += f"\nКОНКУРЕНТ {i+1} ({comp['title']}):\n{c_content[:1000]}"
+
+        TASK_STATUS[chat_id] = "📝 Генерирую стратегию статей..."
+
+        spy_prompt = f"""
+ДАННЫЕ КЛИЕНТА:
+{client_raw_data[:5000]}
+
+КОНКУРЕНТЫ:
+{comp_analysis_text[:3000]}
+
+НИША: {niche_guess}
+
+Выполни анализ согласно SPY_SYSTEM. Верни строго JSON.
+"""
+        raw_json_response = await agroq(spy_prompt, max_tokens=2000, system=SPY_SYSTEM, timeout=90)
+        
+        if not raw_json_response:
+            raise Exception("LLM failed to generate strategy")
+
+        # Парсим JSON (очищаем от markdown блоков если есть)
+        clean_json = raw_json_response.replace("```json", "").replace("```", "").strip()
+        try:
+            strategy_data = json.loads(clean_json)
+        except:
+            # Если JSON битый, сохраняем как текст fallback
+            strategy_data = {"raw_text": raw_json_response, "article_ideas": []}
+
+        # 3. Сохранение в БД
         res_strategy = supabase.table("market_strategies").insert({
             "user_id": chat_id,
-            "niche_keyword": niche_keyword,
-            "full_report": spy_report,
-            "target_audience_profile": "Extracted from report", 
-            "tone_of_voice_guide": "Extracted from report",
+            "niche_keyword": niche_guess,
+            "full_report": raw_json_response,
+            "target_audience_profile": ", ".join(strategy_data.get("audience_pains", [])),
+            "tone_of_voice_guide": "Живой язык ЦА",
             "status": "active"
         }).execute()
         
-        if not res_strategy.data:
-             raise Exception("Strategy insert returned empty data")
-             
         strategy_id = res_strategy.data[0]['id']
         
-        # Создаем первую идею
-        supabase.table("article_ideas_queue").insert({
-            "strategy_id": strategy_id,
-            "topic_title": "Стартовая статья: Разбор главной боли ЦА",
-            "pain_point": "Недоверие к качеству материалов",
-            "competitor_weakness": "Конкуренты используют сырое дерево",
-            "relevance_score": 10.0,
-            "is_processed": False
+        ideas = strategy_data.get("article_ideas", [])
+        if not ideas:
+            ideas = [{"topic": "Стартовая статья", "pain_point": "Боль клиента", "weakness_to_hammer": "Слабость конкурента", "score": 10.0}]
+
+        for idea in ideas[:5]: # Создаем первые 5 идей
+            supabase.table("article_ideas_queue").insert({
+                "strategy_id": strategy_id,
+                "topic_title": idea.get("topic", "Новая тема"),
+                "pain_point": idea.get("pain_point", ""),
+                "competitor_weakness": idea.get("weakness_to_hammer", ""),
+                "relevance_score": float(idea.get("score", 5.0)),
+                "is_processed": False
+            }).execute()
+
+        TASK_STATUS[chat_id] = "✅ Стратегия готова!"
+        
+        # Переход к настройке фото
+        await state.update_data(strategy_id=strategy_id, niche=niche_guess)
+        await state.set_state(OnboardingStates.photo_setup)
+        
+        kb_photo = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📸 Свои фото (Яндекс.Диск)", callback_data="set_disk_url")],
+            [InlineKeyboardButton(text="✨ Генерировать самим", callback_data="use_ai_gen")]
+        ])
+        
+        await bot.send_message(
+            chat_id,
+            "✅ **Стратегия готова!**\n\n"
+            "Я изучил рынок и подготовил план статей.\n\n"
+            "Настрой визуал:",
+            reply_markup=kb_photo
+        )
+
+    except Exception as e:
+        logger.exception(f"Spy Worker Error: {e}")
+        TASK_STATUS[chat_id] = f"❌ Ошибка: {str(e)[:50]}"
+        await bot.send_message(chat_id, f"⚠️ Произошла ошибка при анализе: {str(e)[:100]}. Попробуй снова.", reply_markup=get_menu())
+
+async def worker_produce_article(chat_id: int, state: FSMContext, idea: dict, idea_id: int):
+    start_time = time.time()
+    TASK_STATUS[chat_id] = "✍️ Пишу статью..."
+    
+    try:
+        strat_res = supabase.table("market_strategies").select("*").eq("user_id", chat_id).order("created_at", desc=True).limit(1).execute()
+        context = ""
+        if strat_res.data:
+            s = strat_res.data[0]
+            context = f"Тон: {s.get('tone_of_voice_guide')} | ЦА: {s.get('target_audience_profile')}"
+            
+        writer_prompt = f"""
+Тема: {idea['topic_title']}
+Боль: {idea['pain_point']}
+Слабость конкурента: {idea['competitor_weakness']}
+Контекст: {context}
+
+Напиши статью для Дзен.
+"""
+        
+        dzen_text = await agroq(writer_prompt, max_tokens=2500, system=WRITER_DZEN_SYSTEM, timeout=120)
+        if not dzen_text: raise Exception("Text generation failed")
+        
+        titles_res = await agroq(f"Заголовки для:\n{dzen_text[:300]}...", max_tokens=200, system=TITLE_GEN_SYSTEM, timeout=30)
+        vc_text = await agroq(f"Адаптируй под VC:\n{dzen_text}", max_tokens=2500, system=WRITER_VC_SYSTEM, timeout=120)
+        teaser_tg = await agroq(f"Тизер для TG:\n{dzen_text}", max_tokens=300, system=TEASER_SYSTEM, timeout=30)
+        
+        image_url = "https://images.unsplash.com/photo-1518780664697-55e3ad937233?w=1200&h=630&fit=crop" 
+        
+        res_insert = supabase.table("published_articles").insert({
+            "idea_id": idea_id,
+            "user_id": chat_id,
+            "dzen_content": dzen_text,
+            "vc_ru_content": vc_text,
+            "telegram_preview": teaser_tg,
+            "max_preview": teaser_tg,
+            "main_image_url": image_url,
+            "title_clickbait": titles_res.split('\n')[0] if titles_res else "",
+            "title_expert": titles_res.split('\n')[1] if titles_res and len(titles_res.split('\n'))>1 else "",
+            "title_question": titles_res.split('\n')[2] if titles_res and len(titles_res.split('\n'))>2 else "",
+            "publish_status": "ready",
+            "version_status": "draft",
+            "publication_date": str(datetime.now())
         }).execute()
         
+        article_db_id = res_insert.data[0]['id']
+        duration = int(time.time() - start_time)
+        
+        msg = f"✅ **СТАТЬЯ ГОТОВА!** ({duration} сек.)\n\n"
+        msg += f"📄 **Начало текста:**\n{dzen_text[:300]}...\n\n"
+        msg += f"🔖 **Заголовки:**\n{titles_res}\n\n"
+        msg += f"📱 **Тизер:**\n{teaser_tg}\n\n"
+        msg += "Что делать?"
+        
+        kb_art = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Править вручную", callback_data=f"edit_manual_{article_db_id}")],
+            [InlineKeyboardButton(text="🔄 Перегенерировать", callback_data=f"regen_{article_db_id}")],
+            [InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_{article_db_id}")],
+            [InlineKeyboardButton(text="📥 Скачать", callback_data="download_archive")]
+        ])
+        
+        await send_long_bot(chat_id, msg, reply_markup=kb_art)
+        TASK_STATUS[chat_id] = "Done"
+        
     except Exception as e:
-        logger.error(f"DB save error in spy: {e}")
-        await bot.send_message(chat_id, f"❌ Ошибка сохранения стратегии: {str(e)[:100]}")
-        TASK_STATUS[chat_id] = "Error: DB Save"
-        return
-
-    await state.update_data(strategy_id=strategy_id, niche=niche_keyword)
-    await state.set_state(OnboardingStates.photo_setup)
-    
-    kb_photo = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📸 Есть свои фото (Яндекс.Диск)", callback_data="set_disk_url")],
-        [InlineKeyboardButton(text="✨ Генерировать самим", callback_data="use_ai_gen")]
-    ])
-    
-    await bot.send_message(
-        chat_id,
-        "✅ **Стратегия готова!**\n\n"
-        "Я изучил рынок и подготовил план статей.\n\n"
-        "Теперь настроим визуал:\n"
-        "1. Если у тебя есть качественные фото работ — дай ссылку на папку в Яндекс.Диске.\n"
-        "2. Если нет — я буду генерировать профессиональные обложки и инфографику сам, ориентируясь на стиль рынка.\n\n"
-        "Выбери вариант:",
-        reply_markup=kb_photo
-    )
-    TASK_STATUS[chat_id] = "Waiting for Photo Choice"
+        logger.exception(f"Article Worker Error: {e}")
+        TASK_STATUS[chat_id] = f"Error: {str(e)[:50]}"
+        await bot.send_message(chat_id, f"⚠️ Ошибка генерации: {str(e)[:100]}", reply_markup=get_menu())
 
 # =========================
 # UI HELPERS
@@ -525,7 +462,7 @@ async def send_long_bot(chat_id: int, text: str, reply_markup=None):
             await bot.send_message(chat_id, part, parse_mode="Markdown", reply_markup=rm)
         except:
             await bot.send_message(chat_id, part, reply_markup=rm)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
 
 # =========================
 # HANDLERS
@@ -534,25 +471,15 @@ async def send_long_bot(chat_id: int, text: str, reply_markup=None):
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
+    register_user_safe(message.from_user.id, message.from_user.username, message.from_user.first_name)
     
-    success = register_user_safe(
-        message.from_user.id, 
-        message.from_user.username, 
-        message.from_user.first_name
-    )
-    
-    if not success:
-        await message.answer("❌ Критическая ошибка базы данных. Обратись к администратору.")
-        return
-
     kb_choice = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🌐 ЕСТЬ ССЫЛКИ (Автопилот)", callback_data="mode_pilot")],
-        [InlineKeyboardButton(text=" НЕТ ССЫЛОК (Глубокий Бриф)", callback_data="mode_interview")]
+        [InlineKeyboardButton(text=" 📝 НЕТ ССЫЛОК (Бриф)", callback_data="mode_interview")]
     ])
     
     await message.answer(
         "👋 Привет! Я твой автономный SEO-агент.\n\n"
-        "Я не просто пишу тексты. Я изучаю твой рынок, шпионю за конкурентами, понимаю боли твоей аудитории и создаю контент, который продает.\n\n"
         "Как начнем?",
         reply_markup=kb_choice
     )
@@ -563,15 +490,8 @@ async def cb_mode_pilot(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(OnboardingStates.pilot_links)
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer(
-        "🔗 Пришли все возможные ссылки на твой бизнес:\n"
-        "• Сайт\n"
-        "• Авито\n"
-        "• ВКонтакте\n"
-        "• Telegram-канал\n"
-        "• МАХ\n\n"
-        "(Через пробел или запятую)\n\n"
-        "💡 Чем больше данных, тем точнее будет мой анализ.",
-        parse_mode="Markdown"
+        "🔗 Пришли ссылки (сайт, авито, вк, тг):\n"
+        "(Через пробел или запятую)"
     )
 
 @dp.callback_query(F.data == "mode_interview")
@@ -580,484 +500,154 @@ async def cb_mode_interview(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(interview_answers={}, step=1)
     await state.set_state(OnboardingStates.interview_q1)
     await callback.message.edit_reply_markup(reply_markup=None)
-    
-    q1 = "1. Что именно ты продаёшь и кому? (Опиши продукт и портрет клиента)"
-    await callback.message.answer(f"❓ {q1}")
+    await callback.message.answer("1. Что продаёшь и кому?")
 
 # --- PILOT LOGIC ---
 
 @dp.message(OnboardingStates.pilot_links)
 async def pilot_get_links(message: types.Message, state: FSMContext):
     uid = message.from_user.id
-    text = message.text.strip()
-    
-    urls = extract_urls(text)
+    urls = extract_urls(message.text)
     if not urls:
-        await message.answer("Не вижу ссылок. Пришли URL.")
+        await message.answer("Не вижу ссылок.")
         return
 
-    input_data = {
-        "links": urls,
-        "description": text,
-        "keyword_guess": "" 
-    }
+    input_data = {"links": urls, "description": message.text, "keyword_guess": ""}
     
-    await schedule_task(uid, worker_market_spy, state, "pilot", input_data)
+    # Запускаем фон
+    task = asyncio.create_task(worker_market_spy(uid, state, "pilot", input_data))
+    ACTIVE_TASKS[uid] = task
+    TASK_STATUS[uid] = "Started"
 
 # --- INTERVIEW LOGIC ---
 
-INTERVIEW_QUESTIONS = {
-    1: "1. Что именно ты продаёшь и кому? (Опиши продукт и портрет клиента)",
-    2: "2. Кто твой идеальный клиент? Какие у него главные страхи при покупке?",
-    3: "3. Почему он должен купить у тебя, а не у конкурента? (Твоя суперсила)",
-    4: "4. Есть ли у тебя кейсы с цифрами? (Было/Стало, экономия времени/денег)",
-    5: "5. Как ты общаешься с клиентами? (Сухо/технически, дружелюбно/простыми словами, дерзко/провокационно?)"
+INTERVIEW_QS = {
+    1: "1. Что продаёшь и кому?",
+    2: "2. Кто идеальный клиент? Его страхи?",
+    3: "3. Почему купить у тебя, а не у конкурента?",
+    4: "4. Есть кейсы с цифрами?",
+    5: "5. Как общаешься с клиентами?"
 }
 
 @dp.message(OnboardingStates.interview_q1)
-async def interview_step_1(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    answers = data.get("interview_answers", {})
-    answers["q1"] = message.text
-    await state.update_data(interview_answers=answers)
-    await state.set_state(OnboardingStates.interview_q2)
-    await message.answer(f"❓ {INTERVIEW_QUESTIONS[2]}")
+async def iq1(m: types.Message, s: FSMContext):
+    d = await s.get_data(); ans = d.get("interview_answers", {}); ans["q1"]=m.text
+    await s.update_data(interview_answers=ans); await s.set_state(OnboardingStates.interview_q2)
+    await m.answer(INTERVIEW_QS[2])
 
 @dp.message(OnboardingStates.interview_q2)
-async def interview_step_2(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    answers = data.get("interview_answers", {})
-    answers["q2"] = message.text
-    await state.update_data(interview_answers=answers)
-    await state.set_state(OnboardingStates.interview_q3)
-    await message.answer(f"❓ {INTERVIEW_QUESTIONS[3]}")
+async def iq2(m: types.Message, s: FSMContext):
+    d = await s.get_data(); ans = d.get("interview_answers", {}); ans["q2"]=m.text
+    await s.update_data(interview_answers=ans); await s.set_state(OnboardingStates.interview_q3)
+    await m.answer(INTERVIEW_QS[3])
 
 @dp.message(OnboardingStates.interview_q3)
-async def interview_step_3(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    answers = data.get("interview_answers", {})
-    answers["q3"] = message.text
-    await state.update_data(interview_answers=answers)
-    await state.set_state(OnboardingStates.interview_q4)
-    await message.answer(f"❓ {INTERVIEW_QUESTIONS[4]}")
+async def iq3(m: types.Message, s: FSMContext):
+    d = await s.get_data(); ans = d.get("interview_answers", {}); ans["q3"]=m.text
+    await s.update_data(interview_answers=ans); await s.set_state(OnboardingStates.interview_q4)
+    await m.answer(INTERVIEW_QS[4])
 
 @dp.message(OnboardingStates.interview_q4)
-async def interview_step_4(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    answers = data.get("interview_answers", {})
-    answers["q4"] = message.text
-    await state.update_data(interview_answers=answers)
-    await state.set_state(OnboardingStates.interview_q5)
-    await message.answer(f"❓ {INTERVIEW_QUESTIONS[5]}")
+async def iq4(m: types.Message, s: FSMContext):
+    d = await s.get_data(); ans = d.get("interview_answers", {}); ans["q4"]=m.text
+    await s.update_data(interview_answers=ans); await s.set_state(OnboardingStates.interview_q5)
+    await m.answer(INTERVIEW_QS[5])
 
 @dp.message(OnboardingStates.interview_q5)
-async def interview_step_5(message: types.Message, state: FSMContext):
-    uid = message.from_user.id
-    data = await state.get_data()
-    answers = data.get("interview_answers", {})
-    answers["q5"] = message.text
+async def iq5(m: types.Message, s: FSMContext):
+    uid = m.from_user.id
+    d = await s.get_data(); ans = d.get("interview_answers", {}); ans["q5"]=m.text
+    full_desc = " ".join(ans.values())
+    input_data = {"description": full_desc, "answers": ans, "keyword_guess": ans.get("q1","")[:50], "links":[]}
     
-    full_desc = " ".join([f"{v}" for v in answers.values()])
-    
-    input_data = {
-        "description": full_desc,
-        "answers": answers,
-        "keyword_guess": answers.get("q1", "")[:50],
-        "links": []
-    }
-    
-    await schedule_task(uid, worker_market_spy, state, "interview", input_data)
+    task = asyncio.create_task(worker_market_spy(uid, s, "interview", input_data))
+    ACTIVE_TASKS[uid] = task
+    TASK_STATUS[uid] = "Started"
 
-# --- PHOTO SETUP LOGIC ---
+# --- PHOTO SETUP ---
 
 @dp.callback_query(F.data == "set_disk_url")
-async def cb_set_disk_url(callback: types.CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await state.set_state(OnboardingStates.photo_setup) 
-    await callback.message.answer(
-        "📂 Пришли ссылку на папку с фото в Яндекс.Диске.\n"
-        "Пример: https://disk.yandex.ru/d/xxxxxx\n\n"
-        "Я скачаю лучшие кадры и буду использовать их как референс для стиля и прямых вставок.",
-        parse_mode="Markdown"
-    )
+async def cb_set_disk(cb: types.CallbackQuery, s: FSMContext):
+    await cb.answer()
+    await s.set_state(OnboardingStates.photo_setup)
+    await cb.message.answer("Пришли ссылку на Яндекс.Диск:")
 
 @dp.callback_query(F.data == "use_ai_gen")
-async def cb_use_ai_gen(callback: types.CallbackQuery, state: FSMContext):
-    await callback.answer()
-    uid = callback.from_user.id
-    
-    # ИСПРАВЛЕНИЕ: Правильный способ upsert/update settings
+async def cb_use_ai(cb: types.CallbackQuery, s: FSMContext):
+    await cb.answer()
+    uid = cb.from_user.id
     try:
-        # Сначала пробуем обновить
-        update_res = supabase.table("user_settings").update({
-            "use_generated_images": True,
-            "yandex_disk_folder_url": None
-        }).eq("user_id", uid).execute()
-        
-        # Если ничего не обновилось (нет записи), создаем новую
-        if not update_res.data:
-            supabase.table("user_settings").insert({
-                "user_id": uid,
-                "use_generated_images": True,
-                "yandex_disk_folder_url": None
-            }).execute()
-            
-    except Exception as e:
-        logger.error(f"Settings save error: {e}")
-    
-    await show_dashboard(callback.message, state, uid)
+        upd = supabase.table("user_settings").update({"use_generated_images": True}).eq("user_id", uid).execute()
+        if not upd.data:
+            supabase.table("user_settings").insert({"user_id": uid, "use_generated_images": True}).execute()
+    except: pass
+    await show_dashboard(cb.message, s, uid)
 
 @dp.message(OnboardingStates.photo_setup)
-async def handle_disk_url(message: types.Message, state: FSMContext):
-    uid = message.from_user.id
-    url = message.text.strip()
-    
+async def handle_disk(m: types.Message, s: FSMContext):
+    uid = m.from_user.id
+    url = m.text.strip()
     if "disk.yandex.ru" not in url:
-        await message.answer("Это не ссылка на Яндекс.Диск. Проверь адрес.")
-        return
-        
+        await m.answer("Не та ссылка."); return
     try:
-        # ИСПРАВЛЕНИЕ: Аналогично выше
-        update_res = supabase.table("user_settings").update({
-            "use_generated_images": False,
-            "yandex_disk_folder_url": url
-        }).eq("user_id", uid).execute()
-        
-        if not update_res.data:
-            supabase.table("user_settings").insert({
-                "user_id": uid,
-                "use_generated_images": False,
-                "yandex_disk_folder_url": url
-            }).execute()
-            
-    except Exception as e:
-        logger.error(f"Save settings error: {e}")
-        
-    await show_dashboard(message, state, uid)
+        upd = supabase.table("user_settings").update({"yandex_disk_folder_url": url, "use_generated_images": False}).eq("user_id", uid).execute()
+        if not upd.data:
+            supabase.table("user_settings").insert({"user_id": uid, "yandex_disk_folder_url": url, "use_generated_images": False}).execute()
+    except: pass
+    await show_dashboard(m, s, uid)
 
-# --- DASHBOARD LOGIC ---
+# --- DASHBOARD ---
 
 async def show_dashboard(message: types.Message, state: FSMContext, uid: int):
     await state.set_state(OnboardingStates.dashboard)
-    
     try:
-        # Получаем следующую необработанную идею
         ideas_res = supabase.table("article_ideas_queue").select("*").eq("is_processed", False).order("relevance_score", desc=True).limit(1).execute()
         next_idea = ideas_res.data[0] if ideas_res.data else None
         
-        # ИСПРАВЛЕНИЕ: Правильный подсчет количества
         today_str = str(date.today())
-        articles_res = supabase.table("published_articles").select("*", count="exact").filter("publication_date", "gte", today_str).eq("user_id", uid).execute()
-        count_today = articles_res.count if articles_res.count else 0
-        
-    except Exception as e:
-        logger.error(f"Dashboard load error: {e}")
-        next_idea = None
-        count_today = 0
+        arts_res = supabase.table("published_articles").select("*", count="exact").filter("publication_date", "gte", today_str).eq("user_id", uid).execute()
+        count_today = arts_res.count if arts_res.count else 0
+    except:
+        next_idea = None; count_today = 0
         
     msg = f"📋 **МОИ ЗАДАЧИ**\n\n"
-    msg += f" **Статус:** Активен\n"
     msg += f"🔹 **Написано сегодня:** {count_today}/{DAILY_LIMIT}\n"
-    
     if next_idea:
-        msg += f"\n🚀 **Следующая тема:**\n\"{next_idea['topic_title']}\"\n"
-        msg += f"💥 **Боль ЦА:** {next_idea['pain_point']}\n"
-        msg += "\nНажми 🚀 **Новая статья**, чтобы начать производство."
+        msg += f"\n🚀 **Следующая тема:** \"{next_idea['topic_title']}\"\n"
     else:
-        msg += "\n⚠️ **Очередь идей пуста.** Нужно обновить стратегию (/start).\n"
+        msg += "\n⚠️ Нет идей. Нажми /start для новой стратегии.\n"
         
     kb_dash = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚀 Новая статья", callback_data="generate_next_article")],
-        [InlineKeyboardButton(text="⚙️ Настройки каналов", callback_data="setup_channels")],
         [InlineKeyboardButton(text="📥 Скачать архив", callback_data="download_archive")]
     ])
-    
     await message.answer(msg, reply_markup=kb_dash, parse_mode="Markdown")
 
 @dp.callback_query(F.data == "generate_next_article")
-async def cb_generate_next(callback: types.CallbackQuery, state: FSMContext):
-    await callback.answer()
-    uid = callback.from_user.id
+async def cb_generate(cb: types.CallbackQuery, s: FSMContext):
+    await cb.answer()
+    uid = cb.from_user.id
     
-    # ИСПРАВЛЕНИЕ: Проверка лимита с правильным счетчиком
-    try:
-        today_str = str(date.today())
-        articles_res = supabase.table("published_articles").select("*", count="exact").filter("publication_date", "gte", today_str).eq("user_id", uid).execute()
-        current_count = articles_res.count if articles_res.count else 0
-        
-        if current_count >= DAILY_LIMIT:
-            await callback.message.answer(f"⛔ **Лимит исчерпан.**\nМаксимум {DAILY_LIMIT} статьи в день. Жди завтра!")
-            return
-    except: pass
+    # Лимит
+    today_str = str(date.today())
+    arts_res = supabase.table("published_articles").select("*", count="exact").filter("publication_date", "gte", today_str).eq("user_id", uid).execute()
+    if arts_res.count >= DAILY_LIMIT:
+        await cb.message.answer("⛔ Лимит исчерпан."); return
     
-    # Берем следующую идею
-    try:
-        ideas_res = supabase.table("article_ideas_queue").select("*").eq("is_processed", False).order("relevance_score", desc=True).limit(1).execute()
-        if not ideas_res.data:
-            await callback.message.answer("❌ Нет идей в очереди. Обнови стратегию.")
-            return
-            
-        idea = ideas_res.data[0]
-        idea_id = idea['id']
+    # Взять идею
+    ideas_res = supabase.table("article_ideas_queue").select("*").eq("is_processed", False).order("relevance_score", desc=True).limit(1).execute()
+    if not ideas_res.data:
+        await cb.message.answer("❌ Нет идей."); return
         
-        supabase.table("article_ideas_queue").update({"is_processed": True}).eq("id", idea_id).execute()
-        
-    except Exception as e:
-        await callback.message.answer(f"❌ Ошибка БД: {e}")
-        return
-
-    await callback.message.answer(f"✍️ **Пишу статью:** \"{idea['topic_title']}\"...\nАдаптирую под все площадки.", disable_notification=True)
+    idea = ideas_res.data[0]
+    supabase.table("article_ideas_queue").update({"is_processed": True}).eq("id", idea['id']).execute()
     
-    await schedule_task(uid, worker_produce_article, state, idea, idea_id)
+    await cb.message.answer(f"✍️ Пишу: \"{idea['topic_title']}\"...")
+    task = asyncio.create_task(worker_produce_article(uid, s, idea, idea['id']))
+    ACTIVE_TASKS[uid] = task
+    TASK_STATUS[uid] = "Writing Article"
 
-async def worker_produce_article(chat_id: int, state: FSMContext, idea: dict, idea_id: int):
-    start_time = time.time()
-    TASK_STATUS[chat_id] = "Generating Article..."
-    
-    try:
-        strat_res = supabase.table("market_strategies").select("tone_of_voice_guide, target_audience_profile").eq("user_id", chat_id).order("created_at", desc=True).limit(1).execute()
-        context = ""
-        if strat_res.data:
-            context = f"Тон: {strat_res.data[0].get('tone_of_voice_guide', '')}\nЦА: {strat_res.data[0].get('target_audience_profile', '')}"
-            
-        writer_prompt = f"""
-Тема: {idea['topic_title']}
-Боль ЦА: {idea['pain_point']}
-Слабость конкурента: {idea['competitor_weakness']}
-Инструкция по тону: См. ToneOfVoiceGuide в стратегии.
-
-Напиши статью для Дзена.
-"""
-        full_writer_prompt = f"{writer_prompt}\n\nКОНТЕКСТ СТРАТЕГИИ:\n{context}"
-        
-        # Шаг 1: Основной текст
-        await bot.send_message(chat_id, "📝 Этап 1/4: Пишу основной текст для Дзена...", disable_notification=True)
-        dzen_text = await agroq(full_writer_prompt, max_tokens=2600, system=WRITER_DZEN_SYSTEM, timeout=120)
-        
-        if not dzen_text:
-            raise Exception("Failed to generate main text")
-            
-        # Шаг 2: Заголовки (ИСПОЛЬЗУЕМ TITLE_GEN_SYSTEM)
-        await bot.send_message(chat_id, "🔖 Этап 2/4: Генерирую варианты заголовков...", disable_notification=True)
-        titles_prompt = f"Придумай 3 заголовка для этой статьи:\n{dzen_text[:500]}..."
-        titles_res = await agroq(titles_prompt, max_tokens=200, system=TITLE_GEN_SYSTEM, timeout=30)
-        
-        # Шаг 3: VC.RU
-        await bot.send_message(chat_id, "📰 Этап 3/4: Адаптирую под VC.RU...", disable_notification=True)
-        vc_text = await agroq(f"Адаптируй под vc.ru:\n{dzen_text}", max_tokens=2600, system=WRITER_VC_SYSTEM, timeout=120)
-        
-        # Шаг 4: Тизеры
-        await bot.send_message(chat_id, "📱 Этап 4/4: Делаю тизеры для Telegram/МАХ...", disable_notification=True)
-        teaser_tg = await agroq(f"Напиши тизер для TG:\n{dzen_text}", max_tokens=300, system=TEASER_SYSTEM, timeout=30)
-        teaser_max = teaser_tg 
-        
-        img_prompt = await agroq(f"Опиши визуал для статьи: {idea['topic_title']}...", max_tokens=100, system=IMAGE_GEN_SYSTEM, timeout=30)
-        
-        image_url = "https://images.unsplash.com/photo-1518780664697-55e3ad937233?w=1200&h=630&fit=crop" 
-        
-        try:
-            res_insert = supabase.table("published_articles").insert({
-                "idea_id": idea_id,
-                "user_id": chat_id,
-                "dzen_content": dzen_text,
-                "vc_ru_content": vc_text,
-                "telegram_preview": teaser_tg,
-                "max_preview": teaser_max,
-                "main_image_url": image_url,
-                "title_clickbait": titles_res.split('\n')[0] if titles_res else "",
-                "title_expert": titles_res.split('\n')[1] if titles_res and len(titles_res.split('\n'))>1 else "",
-                "title_question": titles_res.split('\n')[2] if titles_res and len(titles_res.split('\n'))>2 else "",
-                "publish_status": "ready",
-                "version_status": "draft",
-                "publication_date": str(datetime.now())
-            }).execute()
-            
-            article_db_id = res_insert.data[0]['id']
-            
-        except Exception as e:
-            logger.error(f"Save article error: {e}")
-            raise e
-
-        duration = int(time.time() - start_time)
-        msg = f"✅ **СТАТЬЯ ГОТОВА!** (Заняло {duration} сек.)\n\n"
-        msg += f"📄 **Для Дзена:**\n{dzen_text[:500]}...\n\n"
-        msg += f" **Заголовки:**\n{titles_res}\n\n"
-        msg += f"📱 **Тизер для TG/МАХ:**\n{teaser_tg}\n\n"
-        msg += "Что делать дальше?"
-        
-        kb_art = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✏️ Ручная правка", callback_data=f"edit_manual_{article_db_id}")],
-            [InlineKeyboardButton(text="🔄 Перегенерировать", callback_data=f"regen_{article_db_id}")],
-            [InlineKeyboardButton(text="✅ Принять и сохранить", callback_data=f"accept_{article_db_id}")],
-            [InlineKeyboardButton(text="📢 Публиковать в TG", callback_data=f"pub_tg_{article_db_id}")]
-        ])
-        
-        await send_long_bot(chat_id, msg, reply_markup=kb_art)
-        TASK_STATUS[chat_id] = "Done"
-        
-    except Exception as e:
-        logger.exception(f"❌ Worker produce article error for {chat_id}: {e}")
-        await bot.send_message(chat_id, f"⚠️ Ошибка при генерации статьи: {str(e)[:100]}\nПопробуй снова через минуту.", reply_markup=get_menu())
-        TASK_STATUS[chat_id] = f"Error: {str(e)[:50]}"
-
-# =========================
-# EDITING & REGENERATION LOGIC
-# =========================
-
-@dp.callback_query(F.data.startswith("edit_manual_"))
-async def cb_edit_manual(callback: types.CallbackQuery, state: FSMContext):
-    await callback.answer()
-    article_id = int(callback.data.split("_")[2])
-    uid = callback.from_user.id
-    
-    try:
-        res = supabase.table("published_articles").select("dzen_content").eq("id", article_id).single().execute()
-        current_text = res.data["dzen_content"]
-    except:
-        await callback.message.answer("Ошибка загрузки текста.")
-        return
-        
-    await state.update_data(editing_article_id=article_id)
-    await state.set_state(OnboardingStates.editing_article)
-    
-    await callback.message.answer(
-        "✏️ **Режим ручной правки**\n\n"
-        "Пришли полный исправленный текст статьи ниже.\n"
-        "Я заменю им старый вариант.\n\n"
-        "*(Совет: можно скопировать текст, изменить нужные слова и отправить обратно)*",
-        parse_mode="Markdown"
-    )
-
-@dp.message(OnboardingStates.editing_article)
-async def process_manual_edit(message: types.Message, state: FSMContext):
-    uid = message.from_user.id
-    data = await state.get_data()
-    article_id = data.get("editing_article_id")
-    new_text = message.text.strip()
-    
-    if not article_id:
-        await message.answer("Ошибка контекста. /start")
-        return
-        
-    try:
-        old_res = supabase.table("published_articles").select("dzen_content").eq("id", article_id).single().execute()
-        old_text = old_res.data["dzen_content"]
-        
-        supabase.table("article_edit_history").insert({
-            "article_id": article_id,
-            "user_id": uid,
-            "change_type": "manual_text_replace",
-            "old_content_snippet": old_text[:200],
-            "new_content_snippet": new_text[:200]
-        }).execute()
-        
-        supabase.table("published_articles").update({
-            "dzen_content": new_text,
-            "version_status": "edited",
-            "last_edit_time": str(datetime.now())
-        }).eq("id", article_id).execute()
-        
-        cur_val = supabase.table("published_articles").select("edit_count").eq("id", article_id).single().execute().data["edit_count"]
-        supabase.table("published_articles").update({"edit_count": cur_val + 1}).eq("id", article_id).execute()
-        
-    except Exception as e:
-        logger.error(f"Edit save error: {e}")
-        await message.answer("❌ Ошибка сохранения правки.")
-        return
-        
-    await message.answer("✅ Правки сохранены!\nТекст обновлен.", reply_markup=get_menu())
-    await state.clear()
-
-@dp.callback_query(F.data.startswith("regen_"))
-async def cb_regen(callback: types.CallbackQuery, state: FSMContext):
-    await callback.answer()
-    article_id = int(callback.data.split("_")[1])
-    uid = callback.from_user.id
-    
-    await callback.message.answer("🔄 **Перегенерация...**\nПишу новый вариант статьи на основе той же темы.", disable_notification=True)
-    
-    try:
-        art_res = supabase.table("published_articles").select("idea_id").eq("id", article_id).single().execute()
-        idea_id = art_res.data["idea_id"]
-        idea_res = supabase.table("article_ideas_queue").select("*").eq("id", idea_id).single().execute()
-        idea = idea_res.data
-        
-        strat_res = supabase.table("market_strategies").select("tone_of_voice_guide, target_audience_profile").eq("user_id", uid).order("created_at", desc=True).limit(1).execute()
-        context = ""
-        if strat_res.data:
-            context = f"Тон: {strat_res.data[0].get('tone_of_voice_guide', '')}\nЦА: {strat_res.data[0].get('target_audience_profile', '')}"
-            
-        writer_prompt = f"""
-Тема: {idea['topic_title']}
-Боль ЦА: {idea['pain_point']}
-Слабость конкурента: {idea['competitor_weakness']}
-Инструкция по тону: {context}
-
-Напиши СТАТЬЮ ЗАНОВО (другими словами, но тот же смысл).
-"""
-        dzen_text = await agroq(writer_prompt, max_tokens=2600, system=WRITER_DZEN_SYSTEM, timeout=120)
-        
-        if not dzen_text:
-            await callback.message.answer("⚠️ Ошибка перегенерации.")
-            return
-            
-        supabase.table("published_articles").update({
-            "dzen_content": dzen_text,
-            "version_status": "regenerated",
-            "last_edit_time": str(datetime.now())
-        }).eq("id", article_id).execute()
-        
-        supabase.table("article_edit_history").insert({
-            "article_id": article_id,
-            "user_id": uid,
-            "change_type": "regenerate",
-            "old_content_snippet": "Previous version",
-            "new_content_snippet": dzen_text[:200]
-        }).execute()
-        
-        await callback.message.answer("✅ Статья перегенерирована!\nНиже новый вариант.", reply_markup=get_menu())
-        await send_long_bot(uid, f"📄 **НОВЫЙ ВАРИАНТ:**\n\n{dzen_text[:500]}...")
-        
-    except Exception as e:
-        logger.error(f"Regen error: {e}")
-        await callback.message.answer("❌ Ошибка перегенерации.")
-
-@dp.callback_query(F.data.startswith("accept_"))
-async def cb_accept(callback: types.CallbackQuery, state: FSMContext):
-    await callback.answer()
-    article_id = int(callback.data.split("_")[1])
-    
-    try:
-        supabase.table("published_articles").update({
-            "version_status": "final_approved"
-        }).eq("id", article_id).execute()
-        
-        await callback.message.answer("✅ Статья принята как финальная версия.\nМожно публиковать.", reply_markup=get_menu())
-    except Exception as e:
-        await callback.message.answer(f"Ошибка: {e}")
-
-@dp.callback_query(F.data.startswith("pub_tg_"))
-async def cb_pub_tg(callback: types.CallbackQuery, state: FSMContext):
-    await callback.answer()
-    article_id = int(callback.data.split("_")[2])
-    uid = callback.from_user.id
-    
-    await callback.message.answer("📢 Публикация в Telegram-канал...\n(Функция требует настройки токена канала)", reply_markup=get_menu())
-
-# =========================
-# COMMANDS & UTILS (FIXED SYNTAX)
-# =========================
-
-@dp.message(Command("help"))
-async def cmd_help(message: types.Message):
-    await message.answer(
-        "📋 **Команды:**\n"
-        "/start - Начать заново\n"
-        "/status - Проверить статус\n"
-        "/settings - Настроить каналы\n"
-        "/download - Скачать архив статей",
-        reply_markup=get_menu()
-    )
+# --- STATUS COMMAND (INSTANT RESPONSE) ---
 
 @dp.message(Command("status"))
 @dp.message(F.text == "⏳ Где мой текст?")
@@ -1067,51 +657,89 @@ async def cmd_status(message: types.Message, state: FSMContext):
     task_status = TASK_STATUS.get(uid, "Idle")
     is_busy = uid in ACTIVE_TASKS and not ACTIVE_TASKS[uid].done()
     
-    status_msg = f"🧠 **Процесс работы агента:**\n\n"
-    status_msg += f"🔹 **Текущее состояние:** `{current_state or 'None'}`\n"
-    status_msg += f"🔹 **Фоновая задача:** {'🟢 РАБОТАЕТ' if is_busy else '⚪ СВОБОДНА'}\n"
-    status_msg += f"🔹 **Этап выполнения:** `{task_status}`\n"
+    status_msg = f"🧠 **Процесс агента:**\n\n"
+    status_msg += f"🔹 **FSM:** `{current_state or 'None'}`\n"
+    status_msg += f"🔹 **Задача:** {'🟢 РАБОТАЕТ' if is_busy else '⚪ СВОБОДНА'}\n"
+    status_msg += f"🔹 **Этап:** `{task_status}`\n"
     
     if is_busy:
-        status_msg += "\n⏳ Агент пишет текст. Подожди завершения операции. Максимум 5 минут."
+        status_msg += "\n⏳ Жди завершения (до 5 мин)."
     else:
-        status_msg += "\n✅ Агент свободен. Можешь нажать '🚀 Новая статья' или посмотреть дашборд."
+        status_msg += "\n✅ Агент свободен."
         
     await message.answer(status_msg, reply_markup=get_menu())
 
-@dp.callback_query(F.data == "setup_channels")
-async def cb_setup_channels(callback: types.CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await callback.message.answer(
-        "⚙️ **Настройка каналов публикации**\n\n"
-        "1. **Telegram:** Добавь бота в админы канала и пришли username (@channel).\n"
-        "2. **Дзен:** Сейчас автоматическая публикация через API ограничена. Я буду готовить готовые посты для копирования или использовать RSS-боты.\n"
-        "3. **VC.RU:** Я буду формировать письмо редактору. Пришли email для контактов?\n\n"
-        "Пришли данные в формате:\nTG:@mychan\nEMAIL:test@mail.ru",
-        parse_mode="Markdown"
-    )
+# --- EDITING & OTHERS ---
+
+@dp.callback_query(F.data.startswith("edit_manual_"))
+async def cb_edit_manual(cb: types.CallbackQuery, s: FSMContext):
+    await cb.answer()
+    aid = int(cb.data.split("_")[2])
+    await s.update_data(editing_article_id=aid)
+    await s.set_state(OnboardingStates.editing_article)
+    await cb.message.answer("✏️ Пришли новый текст статьи:")
+
+@dp.message(OnboardingStates.editing_article)
+async def process_edit(m: types.Message, s: FSMContext):
+    uid = m.from_user.id
+    d = await s.get_data(); aid = d.get("editing_article_id"); new_txt = m.text.strip()
+    if not aid: await m.answer("Ошибка контекста."); return
+    
+    try:
+        old = supabase.table("published_articles").select("dzen_content").eq("id", aid).single().execute().data["dzen_content"]
+        supabase.table("article_edit_history").insert({"article_id": aid, "user_id": uid, "change_type": "manual", "old_content_snippet": old[:200], "new_content_snippet": new_txt[:200]}).execute()
+        supabase.table("published_articles").update({"dzen_content": new_txt, "version_status": "edited", "last_edit_time": str(datetime.now())}).eq("id", aid).execute()
+        await m.answer("✅ Сохранено.", reply_markup=get_menu())
+        await s.clear()
+    except Exception as e:
+        await m.answer(f"Ошибка: {e}")
+
+@dp.callback_query(F.data.startswith("regen_"))
+async def cb_regen(cb: types.CallbackQuery, s: FSMContext):
+    await cb.answer()
+    aid = int(cb.data.split("_")[1]); uid = cb.from_user.id
+    await cb.message.answer("🔄 Перегенерация...")
+    
+    art = supabase.table("published_articles").select("idea_id").eq("id", aid).single().execute().data
+    iid = art["idea_id"]
+    idea = supabase.table("article_ideas_queue").select("*").eq("id", iid).single().execute().data
+    
+    strat = supabase.table("market_strategies").select("*").eq("user_id", uid).order("created_at", desc=True).limit(1).execute().data[0]
+    ctx = f"Тон: {strat.get('tone_of_voice_guide')}"
+    
+    wprompt = f"Тема: {idea['topic_title']}\nБоль: {idea['pain_point']}\nКонтекст: {ctx}\nНапиши заново."
+    txt = await agroq(wprompt, max_tokens=2500, system=WRITER_DZEN_SYSTEM, timeout=120)
+    
+    if txt:
+        supabase.table("published_articles").update({"dzen_content": txt, "version_status": "regenerated", "last_edit_time": str(datetime.now())}).eq("id", aid).execute()
+        await cb.message.answer("✅ Обновлено!", reply_markup=get_menu())
+        await send_long_bot(uid, f"📄 Новый вариант:\n{txt[:500]}...")
+    else:
+        await cb.message.answer("⚠️ Ошибка перегенерации.")
+
+@dp.callback_query(F.data.startswith("accept_"))
+async def cb_accept(cb: types.CallbackQuery, s: FSMContext):
+    await cb.answer()
+    aid = int(cb.data.split("_")[1])
+    supabase.table("published_articles").update({"version_status": "final_approved"}).eq("id", aid).execute()
+    await cb.message.answer("✅ Принято.", reply_markup=get_menu())
 
 @dp.callback_query(F.data == "download_archive")
-async def cb_download_archive(callback: types.CallbackQuery):
-    await callback.answer()
-    uid = callback.from_user.id
-    try:
-        res = supabase.table("published_articles").select("*").eq("user_id", uid).order("created_at", desc=True).limit(10).execute()
-        if not res.data:
-            await callback.message.answer("Нет статей.")
-            return
-        
-        all_text = ""
-        for art in res.data:
-            all_text += f"\n\n{'='*30}\nID: {art['id']}\n{'='*30}\n"
-            all_text += f"[DZEN]\n{art['dzen_content']}\n\n"
-            all_text += f"[VC.RU]\n{art['vc_ru_content']}\n\n"
-            all_text += f"[TEASER]\n{art['telegram_preview']}\n"
-            
-        doc = BufferedInputFile(all_text.encode('utf-8'), filename="seo_pack_full.txt")
-        await callback.message.answer_document(doc, caption="💾 Архив статей")
-    except Exception as e:
-        await callback.message.answer(f"Ошибка: {e}")
+async def cb_download(cb: types.CallbackQuery):
+    await cb.answer()
+    uid = cb.from_user.id
+    res = supabase.table("published_articles").select("*").eq("user_id", uid).order("created_at", desc=True).limit(10).execute()
+    if not res.data: await cb.message.answer("Нет статей."); return
+    
+    all_text = ""
+    for a in res.data:
+        all_text += f"\n{'='*30}\nID:{a['id']}\n[DZEN]\n{a['dzen_content']}\n"
+    doc = BufferedInputFile(all_text.encode('utf-8'), filename="seo_pack.txt")
+    await cb.message.answer_document(doc, caption="💾 Архив")
+
+@dp.message(Command("help"))
+async def cmd_help(m: types.Message):
+    await m.answer("/start - Начать\n/status - Проверить процесс\n/help - Помощь", reply_markup=get_menu())
 
 # =========================
 # MIDDLEWARE & SERVER
@@ -1126,7 +754,7 @@ class ErrorHandlerMiddleware(BaseMiddleware):
             try:
                 msg = getattr(event, 'message', None) or getattr(getattr(event, 'callback_query', None), 'message', None)
                 if msg:
-                    await msg.answer("⚠️ Системная ошибка. Нажми ▶️ Продолжить или /start.", reply_markup=get_menu())
+                    await msg.answer("⚠️ Системная ошибка. /start", reply_markup=get_menu())
             except: pass
             return None
 
@@ -1154,16 +782,11 @@ def heartbeat():
 # =========================
 
 async def main():
-    logger.info("🚀 Starting AUTONOMOUS AGENT V5...")
-    
+    logger.info("🚀 Starting FINAL VERSION...")
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-    except Exception as e:
-        logger.warning(f"⚠️ delete_webhook error: {e}")
-    
-    logger.info("⏳ Waiting 10 seconds to avoid Telegram conflict...")
-    await asyncio.sleep(10)
-    
+    except: pass
+    await asyncio.sleep(5) # Пауза меньше, т.к. мы оптимизировали старт
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
 if __name__ == "__main__":
