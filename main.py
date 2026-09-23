@@ -54,25 +54,40 @@ MODELS = ["qwen/qwen3.8-27b"]
 DAILY_LIMIT = 3 
 
 # =========================
-# DATABASE HELPERS
+# DATABASE HELPERS (SAFE)
 # =========================
 
-def ensure_user_exists(user_id: int, username: str = "", first_name: str = ""):
-    """Проверяет наличие пользователя в БД и создает его, если нет."""
+def register_user_safe(user_id: int, username: str = "", first_name: str = "") -> bool:
+    """
+    Гарантированно регистрирует пользователя.
+    Использует upsert, чтобы не упасть, если пользователь уже есть.
+    """
     try:
-        # Проверяем, есть ли уже такой ID
-        res = supabase.table("users").select("*").eq("id", user_id).execute()
-        if not res.data:
-            # Создаем нового пользователя
-            supabase.table("users").insert({
-                "id": user_id,
-                "username": username or "",
-                "first_name": first_name or ""
-            }).execute()
-            logger.info(f"🆕 Created new user in DB: {user_id}")
-        return True
+        # Пытаемся вставить или обновить запись
+        data = {
+            "id": user_id,
+            "username": username or "",
+            "first_name": first_name or ""
+        }
+        
+        # Supabase Python SDK .upsert() требует уникального ключа (primary key)
+        # Для таблицы users PK это id.
+        res = supabase.table("users").upsert(data).execute()
+        
+        if res.data:
+            logger.info(f"🆕 User registered/updated: {user_id}")
+            return True
+        else:
+            logger.warning(f"⚠️ Upsert returned no data for user {user_id}")
+            # Проверяем вручную
+            check = supabase.table("users").select("*").eq("id", user_id).execute()
+            if check.data:
+                return True
+            
+        return False
+        
     except Exception as e:
-        logger.error(f"❌ Error ensuring user exists: {e}")
+        logger.error(f"❌ CRITICAL DB ERROR registering user {user_id}: {e}")
         return False
 
 # =========================
@@ -301,7 +316,14 @@ async def schedule_task(uid: int, func: Callable, *args, **kwargs):
     ACTIVE_TASKS[uid] = task
 
 async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_data: dict):
-    await bot.send_message(chat_id, "🕵️♂️ **Запускаю глубокий шпионаж...**\nИзучаю конкурентов, анализирую боли ЦА и формирую стратегию.\nЭто займет 2-3 минуты.", disable_notification=True)
+    # 1. Проверка наличия пользователя (гарантия от /start)
+    user_check = supabase.table("users").select("id").eq("id", chat_id).execute()
+    if not user_check.data:
+        logger.error(f"❌ USER MISSING IN DB during spy work: {chat_id}")
+        await bot.send_message(chat_id, "❌ Критическая ошибка: Пользователь не найден в базе. Напиши /start заново.")
+        return
+
+    await bot.send_message(chat_id, "🕵️️ **Запускаю глубокий шпионаж...**\nИзучаю конкурентов, анализирую боли ЦА и формирую стратегию.\nЭто займет 2-3 минуты.", disable_notification=True)
     
     client_raw_data = ""
     if mode == "pilot":
@@ -369,17 +391,8 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
         await bot.send_message(chat_id, "⚠️ Ошибка анализа. Попробуй позже.", reply_markup=get_menu())
         return
 
-    # --- ВАЖНОЕ ИСПРАВЛЕНИЕ: Регистрация пользователя перед сохранением ---
-    # Получаем данные юзера из контекста сообщения (если возможно) или используем заглушку
-    # Так как мы в фоновом потоке, у нас нет объекта message.from_user напрямую, 
-    # но chat_id это и есть user_id в Telegram.
-    
-    user_registered = ensure_user_exists(chat_id)
-    if not user_registered:
-         await bot.send_message(chat_id, "❌ Критическая ошибка базы данных. Пользователь не создан.")
-         return
-
     try:
+        # Сохраняем стратегию
         res_strategy = supabase.table("market_strategies").insert({
             "user_id": chat_id,
             "niche_keyword": niche_keyword,
@@ -389,8 +402,12 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
             "status": "active"
         }).execute()
         
+        if not res_strategy.data:
+             raise Exception("Strategy insert returned empty data")
+             
         strategy_id = res_strategy.data[0]['id']
         
+        # Создаем первую идею
         supabase.table("article_ideas_queue").insert({
             "strategy_id": strategy_id,
             "topic_title": "Стартовая статья: Разбор главной боли ЦА",
@@ -401,8 +418,8 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
         }).execute()
         
     except Exception as e:
-        logger.error(f"DB save error: {e}")
-        await bot.send_message(chat_id, f"❌ Ошибка сохранения данных: {str(e)[:100]}")
+        logger.error(f"DB save error in spy: {e}")
+        await bot.send_message(chat_id, f"❌ Ошибка сохранения стратегии: {str(e)[:100]}")
         return
 
     await state.update_data(strategy_id=strategy_id, niche=niche_keyword)
@@ -457,9 +474,17 @@ async def send_long_bot(chat_id: int, text: str, reply_markup=None):
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     
-    # Регистрируем пользователя сразу при старте
-    ensure_user_exists(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    # ГАРАНТИРОВАННАЯ РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЯ ПЕРЕД ЛЮБЫМИ ДЕЙСТВИЯМИ
+    success = register_user_safe(
+        message.from_user.id, 
+        message.from_user.username, 
+        message.from_user.first_name
+    )
     
+    if not success:
+        await message.answer("❌ Критическая ошибка базы данных. Обратись к администратору.")
+        return
+
     kb_choice = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🌐 ЕСТЬ ССЫЛКИ (Автопилот)", callback_data="mode_pilot")],
         [InlineKeyboardButton(text=" НЕТ ССЫЛОК (Глубокий Бриф)", callback_data="mode_interview")]
@@ -601,16 +626,14 @@ async def cb_use_ai_gen(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
     uid = callback.from_user.id
     
-    # Убеждаемся, что пользователь есть в БД
-    ensure_user_exists(uid)
-    
     try:
         supabase.table("user_settings").upsert({
             "user_id": uid,
             "use_generated_images": True,
             "yandex_disk_folder_url": None
         }).eq("user_id", uid).execute()
-    except: pass
+    except Exception as e:
+        logger.error(f"Settings save error: {e}")
     
     await show_dashboard(callback.message, state, uid)
 
@@ -623,8 +646,6 @@ async def handle_disk_url(message: types.Message, state: FSMContext):
         await message.answer("Это не ссылка на Яндекс.Диск. Проверь адрес.")
         return
         
-    ensure_user_exists(uid)
-    
     try:
         supabase.table("user_settings").upsert({
             "user_id": uid,
@@ -647,7 +668,8 @@ async def show_dashboard(message: types.Message, state: FSMContext, uid: int):
         
         articles_today = supabase.table("published_articles").select("*").filter("publication_date", "gte", str(date.today())).eq("user_id", uid).count().execute()
         count_today = articles_today.count if articles_today.count else 0
-    except:
+    except Exception as e:
+        logger.error(f"Dashboard load error: {e}")
         next_idea = None
         count_today = 0
         
