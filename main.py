@@ -52,17 +52,20 @@ except Exception as e:
     logger.error(f"❌ INIT ERROR: {e}")
     raise
 
-BANNED_NICHES = ["обнал", "отмыв", "адалт", "18+", "порн", "оружие", "наркот", "взлом", "хакер"]
+BANNED_NICHES = [
+    "обнал", "отмыв", "адалт", "18+", "порн",
+    "оружие", "наркот", "взлом", "хакер"
+]
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-# Используем только ту модель, которая реально видна в твоём Groq Usage.
-# Если добавить несуществующие модели, бот будет тратить время на 404 ошибки.
+# Используем только ту модель, которая реально есть в твоём Groq Usage.
 MODELS = [
     "qwen/qwen3.8-27b",
 ]
 
 BASE_SYSTEM = """Ты — элитный SEO-стратег и контент-маркетолог с 15-летним опытом.
+
 СТРОГИЕ ПРАВИЛА:
 1. Пиши ТОЛЬКО на русском.
 2. НЕ используй ### или ##.
@@ -129,18 +132,27 @@ MIN_QUESTIONS = 8
 MAX_QUESTIONS = 15
 
 
-def groq_request(prompt: str, max_tokens: int = 1200, system: Optional[str] = None, timeout: int = 60) -> Optional[str]:
+def groq_request(
+    prompt: str,
+    max_tokens: int = 1200,
+    system: Optional[str] = None,
+    timeout: int = 60
+) -> Optional[str]:
     sys_msg = system or BASE_SYSTEM
     last_error = None
 
     for attempt in range(2):
         for model in MODELS:
             try:
-                logger.info(f"🤖 Groq: trying {model}, max_tokens={max_tokens}, attempt={attempt+1}...")
+                logger.info(
+                    f"🤖 Groq: trying {model}, max_tokens={max_tokens}, attempt={attempt + 1}..."
+                )
+
                 headers = {
                     "Authorization": f"Bearer {GROQ_API_KEY}",
                     "Content-Type": "application/json",
                 }
+
                 payload = {
                     "model": model,
                     "messages": [
@@ -155,10 +167,16 @@ def groq_request(prompt: str, max_tokens: int = 1200, system: Optional[str] = No
 
                 if r.status_code == 200:
                     data = r.json()
-                    result = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    result = (
+                        data.get("choices", [{}])[0]
+                        .get("message", {})
+                        .get("content", "")
+                    )
+
                     if result and result.strip():
                         logger.info(f"✅ Groq OK ({model}): {len(result)} chars")
                         return result.strip()
+
                     logger.warning(f"⚠️ Groq empty response ({model})")
 
                 elif r.status_code == 429:
@@ -187,14 +205,19 @@ def groq_request(prompt: str, max_tokens: int = 1200, system: Optional[str] = No
     return None
 
 
-async def agroq(prompt: str, max_tokens: int = 1200, system: Optional[str] = None, timeout: int = 60) -> Optional[str]:
+async def agroq(
+    prompt: str,
+    max_tokens: int = 1200,
+    system: Optional[str] = None,
+    timeout: int = 60
+) -> Optional[str]:
     try:
         return await asyncio.wait_for(
             asyncio.to_thread(groq_request, prompt, max_tokens, system, timeout),
             timeout=timeout + 15
         )
     except asyncio.TimeoutError:
-        logger.warning(f"⏱️ agroq outer timeout after {timeout+15}s")
+        logger.warning(f"⏱️ agroq outer timeout after {timeout + 15}s")
         return None
     except Exception as e:
         logger.error(f"❌ agroq exception: {e}")
@@ -203,7 +226,10 @@ async def agroq(prompt: str, max_tokens: int = 1200, system: Optional[str] = Non
 
 async def run_sync(func: Callable, *args, timeout: int = 30, default: Any = None) -> Any:
     try:
-        return await asyncio.wait_for(asyncio.to_thread(func, *args), timeout=timeout)
+        return await asyncio.wait_for(
+            asyncio.to_thread(func, *args),
+            timeout=timeout
+        )
     except asyncio.TimeoutError:
         logger.warning(f"⏱️ Sync timeout: {getattr(func, '__name__', str(func))}")
         return default
@@ -258,7 +284,12 @@ class Onboarding(StatesGroup):
 
 
 class ErrorHandlerMiddleware(BaseMiddleware):
-    async def __call__(self, handler: Callable, event: types.Update, data: Dict[str, Any]) -> Any:
+    async def __call__(
+        self,
+        handler: Callable,
+        event: types.Update,
+        data: Dict[str, Any]
+    ) -> Any:
         try:
             return await handler(event, data)
         except Exception as e:
@@ -334,7 +365,8 @@ async def cancel_background(uid: int):
 
 async def _run_background(uid: int, gen: int, func: Callable, *args, **kwargs):
     try:
-        await func(*args, **kwargs)
+        # ВАЖНО: теперь chat_id всегда передаётся первым аргументом автоматически.
+        await func(uid, *args, **kwargs)
     except asyncio.CancelledError:
         logger.info(f"🛑 Background task cancelled for {uid}")
         raise
@@ -466,6 +498,7 @@ def scrape_with_api(
         "url": url,
         "country_code": country_code,
     }
+
     if premium:
         params["premium"] = "true"
     if render:
@@ -474,15 +507,21 @@ def scrape_with_api(
         params["return_text"] = "true"
 
     try:
-        logger.info(f"🌐 Scraping {url[:90]}... premium={premium}, render={render}, return_text={return_text}")
+        logger.info(
+            f"🌐 Scraping {url[:90]}... premium={premium}, render={render}, return_text={return_text}"
+        )
+
         r = requests.get("http://api.scraperapi.com", params=params, timeout=75)
+
         if r.status_code == 200 and len(r.text) > 200:
             low = r.text.lower()
             if ("captcha" in low or "robot" in low) and len(r.text) < 1500:
                 logger.warning(f"⚠️ Captcha/robot page for {url[:90]}")
                 return None
+
             logger.info(f"✅ Scraped {len(r.text)} chars")
             return r.text
+
         logger.warning(f"⚠️ ScraperAPI status {r.status_code}, len={len(r.text)}")
         return None
     except Exception as e:
@@ -583,6 +622,7 @@ def parse_source(url: str):
 def clean_html_text(html: str) -> Optional[str]:
     if not html:
         return None
+
     # Если это уже plain text
     if "<html" not in html.lower() and "<body" not in html.lower() and len(html) > 200:
         return html[:5000]
@@ -590,6 +630,7 @@ def clean_html_text(html: str) -> Optional[str]:
     soup = BeautifulSoup(html, "lxml")
     for s in soup(["script", "style", "nav", "footer", "header", "noscript"]):
         s.decompose()
+
     text = soup.get_text(separator="\n", strip=True)
     return text[:5000] if len(text) > 100 else None
 
@@ -611,15 +652,14 @@ def extract_site_text(url: str) -> Optional[str]:
         if text:
             return text
 
-        # DDGS fallback по домену
         m = re.search(r"https?://([^/]+)", url)
         domain = m.group(1) if m else url
-        text = ddg_snippets([
+
+        return ddg_snippets([
             f"site:{domain}",
             domain,
             f"{domain} официальный сайт",
         ])
-        return text
     except Exception as e:
         logger.error(f"❌ Site parse error: {e}")
         return None
@@ -636,7 +676,6 @@ def extract_telegram_channel(url: str) -> Optional[str]:
 
         text = clean_html_text(html) if html else None
         if text:
-            # Для TG лучше оставить только посты, но clean_html_text уже нормально режет мусор
             return text
 
         return ddg_snippets([
@@ -678,7 +717,10 @@ def extract_avito(url: str) -> Optional[str]:
                 t = tag.get_text(strip=True)
                 if len(t) > 20 and any(
                     w in t.lower()
-                    for w in ["руб", "₽", "дом", "м²", "участок", "этаж", "площадь", "окно", "двер", "утепл"]
+                    for w in [
+                        "руб", "₽", "дом", "м²", "участок",
+                        "этаж", "площадь", "окно", "двер", "утепл"
+                    ]
                 ):
                     if t not in parts:
                         parts.append(t)
@@ -693,16 +735,15 @@ def extract_avito(url: str) -> Optional[str]:
                 logger.info(f"✅ Avito full extracted: {len(full)} chars")
                 return full
 
-        # Plain text attempt
         txt = scrape_with_api(url, premium=True, render=True, return_text=True)
         if txt and len(txt) > 300:
             logger.info(f"✅ Avito return_text: {len(txt)} chars")
             return txt[:5000]
 
-        # DDGS fallback
         ad_match = re.search(r"(\d{6,})", url)
         ad_id = ad_match.group(1) if ad_match else ""
         slug = url.rstrip("/").split("/")[-1].replace("_", " ").replace("-", " ")
+
         queries = []
         if ad_id:
             queries.extend([
@@ -715,6 +756,7 @@ def extract_avito(url: str) -> Optional[str]:
                 f"site:avito.ru {slug}",
                 f"авито {slug}",
             ])
+
         return ddg_snippets(queries)
     except Exception as e:
         logger.error(f"❌ Avito parse error: {e}")
@@ -776,13 +818,11 @@ def extract_vk_group(url: str) -> Optional[str]:
                 logger.info(f"✅ VK full extracted: {len(full)} chars")
                 return full
 
-        # Plain text attempt
         txt = scrape_with_api(f"https://vk.com/{vk}", premium=True, render=True, return_text=True)
         if txt and len(txt) > 300:
             logger.info(f"✅ VK return_text: {len(txt)} chars")
             return txt[:5000]
 
-        # Caches
         for fallback_url in [f"https://vk.com/{vk}", f"https://m.vk.com/{vk}"]:
             html = scrape_google_cache(fallback_url)
             if html:
@@ -798,7 +838,6 @@ def extract_vk_group(url: str) -> Optional[str]:
                     logger.info(f"✅ VK Web Archive: {len(text)} chars")
                     return text
 
-        # DDGS fallback — часто спасает публичные ВК-сообщества
         return ddg_snippets([
             f"site:vk.com {vk}",
             f"vk.com/{vk}",
@@ -813,8 +852,12 @@ def extract_vk_group(url: str) -> Optional[str]:
 async def parse_one_source(url: str):
     st = detect_source_type(url)
     name = source_display_name(st)
+
     try:
-        result = await asyncio.wait_for(asyncio.to_thread(parse_source, url), timeout=100)
+        result = await asyncio.wait_for(
+            asyncio.to_thread(parse_source, url),
+            timeout=100
+        )
         text, typ = result
         return url, typ or name, text
     except asyncio.TimeoutError:
@@ -864,7 +907,12 @@ def get_or_create_user(uid: int, username: str, fname: str):
         result = supabase.table("users").select("*").eq("id", uid).execute()
         if result.data:
             return result.data[0]
-        u = {"id": uid, "username": username or "", "first_name": fname or ""}
+
+        u = {
+            "id": uid,
+            "username": username or "",
+            "first_name": fname or "",
+        }
         supabase.table("users").insert(u).execute()
         return u
     except Exception as e:
@@ -918,14 +966,18 @@ def save_article(uid: int, kw: str, pain: str, title: str, content: str):
 
 def save_article_vc(article_id: Any, vc: str):
     try:
-        supabase.table("articles").update({"vc_version": str(vc)[:15000]}).eq("id", article_id).execute()
+        supabase.table("articles").update(
+            {"vc_version": str(vc)[:15000]}
+        ).eq("id", article_id).execute()
     except Exception as e:
         logger.error(f"❌ VC article save error: {e}")
 
 
 def log_usage(uid: int, action: str):
     try:
-        supabase.table("usage_logs").insert({"user_id": uid, "action": action}).execute()
+        supabase.table("usage_logs").insert(
+            {"user_id": uid, "action": action}
+        ).execute()
     except Exception as e:
         logger.error(f"❌ Usage log error: {e}")
 
@@ -1000,6 +1052,7 @@ def clean_question_text(text: str) -> str:
         "Вопрос:", "Вопрос :", "Q:", "q:", "В:", "?", "❓",
         "1.", "2.", "3.", "4.", "5.",
     ]
+
     for p in prefixes:
         if text.lower().startswith(p.lower()):
             text = text[len(p):].strip()
@@ -1013,7 +1066,12 @@ async def generate_next_action(history: list, source_data: str, priority: str):
     if answered >= MAX_QUESTIONS:
         return "FINISH", None
 
-    hist_text = "\n".join([f"Q{i['q']}: {i['a']}" for i in history]) if history else "Пока нет ответов."
+    hist_text = (
+        "\n".join([f"Q{i['q']}: {i['a']}" for i in history])
+        if history
+        else "Пока нет ответов."
+    )
+
     source_text = (source_data or "")[:3500]
 
     if answered < MIN_QUESTIONS:
@@ -1075,6 +1133,7 @@ async def bg_ask_next_question(chat_id: int, state: FSMContext):
         return
 
     next_num = len(history) + 1
+
     await send_long_bot(
         chat_id,
         f"{progress_text(len(history))}\n\n"
@@ -1092,6 +1151,7 @@ async def bg_ask_next_question(chat_id: int, state: FSMContext):
 async def bg_after_first_answer(chat_id: int, state: FSMContext):
     data = await state.get_data()
     history = data.get("history", [])
+
     if not history:
         return
 
@@ -1108,6 +1168,7 @@ async def bg_after_first_answer(chat_id: int, state: FSMContext):
 
     if check and check.startswith("YES|"):
         services = [s.strip() for s in check.split("|")[1:] if s.strip()]
+
         if services:
             await state.update_data(
                 multiple_services=services,
@@ -1163,7 +1224,10 @@ async def bg_process_manual_source(chat_id: int, state: FSMContext, src: str):
     if analysis:
         await send_long_bot(chat_id, f"📊 **Разведка по тексту:**\n\n{analysis}")
     else:
-        await send_long_bot(chat_id, "⚠️ Не удалось глубоко изучить текст, но я сохраню его и продолжу.")
+        await send_long_bot(
+            chat_id,
+            "⚠️ Не удалось глубоко изучить текст, но я сохраню его и продолжу."
+        )
 
     await state.update_data(
         history=history,
@@ -1178,7 +1242,13 @@ async def bg_process_manual_source(chat_id: int, state: FSMContext, src: str):
     await bg_ask_next_question(chat_id, state)
 
 
-async def bg_parse_sources(chat_id: int, state: FSMContext, urls: list, history: list, priority: str):
+async def bg_parse_sources(
+    chat_id: int,
+    state: FSMContext,
+    urls: list,
+    history: list,
+    priority: str
+):
     parsed = await asyncio.gather(
         *[parse_one_source(url) for url in urls],
         return_exceptions=True,
@@ -1193,6 +1263,7 @@ async def bg_parse_sources(chat_id: int, state: FSMContext, urls: list, history:
             continue
 
         url, typ, text = item
+
         if text:
             results.append(f"✅ **{typ}** — изучен!")
             all_data += f"\n=== {typ}: {url} ===\n{text}\n"
@@ -1225,10 +1296,14 @@ async def bg_parse_sources(chat_id: int, state: FSMContext, urls: list, history:
         if analysis:
             await send_long_bot(
                 chat_id,
-                f"📊 **Результаты изучения:**\n{results_text}\n\n🔎 **Краткая разведка:**\n{analysis}",
+                f"📊 **Результаты изучения:**\n{results_text}\n\n"
+                f"🔎 **Краткая разведка:**\n{analysis}",
             )
         else:
-            await send_long_bot(chat_id, f"📊 **Результаты изучения:**\n{results_text}")
+            await send_long_bot(
+                chat_id,
+                f"📊 **Результаты изучения:**\n{results_text}"
+            )
 
         await state.update_data(
             history=history,
@@ -1277,9 +1352,19 @@ async def bg_finish_interview(chat_id: int, state: FSMContext, history: list):
         run_sync(get_yandex_suggestions, niche_query[:30], timeout=20, default=[]),
     )
 
-    comp_text = "\n".join([f"- {c['title']}: {c['snippet']}" for c in competitors[:5]]) if competitors else "нет"
+    comp_text = (
+        "\n".join([f"- {c['title']}: {c['snippet']}" for c in competitors[:5]])
+        if competitors
+        else "нет"
+    )
+
     sugg_text = ", ".join(suggestions[:10]) if suggestions else "пусто"
-    src_section = f"\n\n=== ДАННЫЕ ИЗ ИСТОЧНИКОВ ===\n{source_data[:5000]}\n" if source_data else ""
+
+    src_section = (
+        f"\n\n=== ДАННЫЕ ИЗ ИСТОЧНИКОВ ===\n{source_data[:5000]}\n"
+        if source_data
+        else ""
+    )
 
     analysis = await agroq(
         f"""Интервью:
@@ -1315,7 +1400,8 @@ async def bg_finish_interview(chat_id: int, state: FSMContext, history: list):
         )
         await send_long_bot(
             chat_id,
-            "⚠️ Не удалось сделать глубокий анализ. Сохраню основные ответы и перейду к завершению онбординга.",
+            "⚠️ Не удалось сделать глубокий анализ. "
+            "Сохраню основные ответы и перейду к завершению онбординга.",
             disable_notification=True,
         )
 
@@ -1346,7 +1432,15 @@ async def bg_finish_interview(chat_id: int, state: FSMContext, history: list):
             timeout=75,
         )
 
-    await run_sync(save_research, chat_id, analysis + "\n\n" + (plan or ""), "", "", comp_text, timeout=20)
+    await run_sync(
+        save_research,
+        chat_id,
+        analysis + "\n\n" + (plan or ""),
+        "",
+        "",
+        comp_text,
+        timeout=20
+    )
 
     await send_long_bot(chat_id, f"🎯 **ПОЛНЫЙ АНАЛИЗ НИШИ:**\n\n{analysis}")
     await asyncio.sleep(1)
@@ -1376,13 +1470,21 @@ async def bg_finish_interview(chat_id: int, state: FSMContext, history: list):
     )
 
     await state.set_state(Onboarding.photos)
-    await state.update_data(awaiting_answer=False, last_question=None, last_question_num=None)
+    await state.update_data(
+        awaiting_answer=False,
+        last_question=None,
+        last_question_num=None,
+    )
 
 
 def fetch_cover_image() -> Optional[bytes]:
     try:
         prompt = "professional blog cover image, modern minimal style, business theme, no text"
-        url = "https://image.pollinations.ai/prompt/" + requests.utils.quote(prompt) + "?width=1200&height=630"
+        url = (
+            "https://image.pollinations.ai/prompt/"
+            + requests.utils.quote(prompt)
+            + "?width=1200&height=630"
+        )
         r = requests.get(url, timeout=60)
         if r.status_code == 200 and len(r.content) > 5000:
             return r.content
@@ -1537,6 +1639,7 @@ async def perform_continue(message: types.Message, state: FSMContext):
     current_state = await state.get_state()
     data = await state.get_data()
     history = data.get("history", [])
+    src_req = data.get("source_requested", False)
 
     if not current_state or not history:
         await message.answer(
@@ -1546,6 +1649,14 @@ async def perform_continue(message: types.Message, state: FSMContext):
         return
 
     if current_state == "Onboarding:gathering":
+        # Если уже 4+ ответа, но источник ещё не запрошен — восстановим запрос источника
+        if len(history) >= 4 and not src_req:
+            await state.update_data(source_requested=True)
+            await message.answer(source_request_text(len(history)), parse_mode="Markdown")
+            await state.set_state(Onboarding.source_link)
+            await state.update_data(waiting_manual=False)
+            return
+
         if data.get("awaiting_answer") and data.get("last_question"):
             await message.answer(
                 f"📌 **Напомню вопрос {data.get('last_question_num')}:**\n"
@@ -1621,6 +1732,7 @@ async def perform_continue(message: types.Message, state: FSMContext):
             [InlineKeyboardButton(text="🔄 Начать заново", callback_data="restart_action")],
         ]
     )
+
     await message.answer(
         "🤔 Не могу точно определить этап.\nЧто делаем?",
         reply_markup=kb,
@@ -1759,23 +1871,25 @@ async def btn_continue_kb(message: types.Message, state: FSMContext):
 @dp.message(F.text == MENU_ARTICLE)
 async def btn_article_kb(message: types.Message):
     chat_id = message.chat.id
+
     if is_busy(chat_id):
         await busy_answer(message)
         return
 
     await message.answer("📝 Запускаю генерацию статьи...", disable_notification=True)
-    await schedule_background(chat_id, bg_generate_article, chat_id)
+    await schedule_background(chat_id, bg_generate_article)
 
 
 @dp.message(Command("article"))
 async def cmd_article(message: types.Message):
     chat_id = message.chat.id
+
     if is_busy(chat_id):
         await busy_answer(message)
         return
 
     await message.answer("📝 Запускаю генерацию статьи...", disable_notification=True)
-    await schedule_background(chat_id, bg_generate_article, chat_id)
+    await schedule_background(chat_id, bg_generate_article)
 
 
 # =========================
@@ -1797,14 +1911,22 @@ async def cb_restart_action(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "retry_parsing")
 async def cb_retry_parsing(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
+
     data = await state.get_data()
     history = data.get("history", [])
+
     await state.set_state(Onboarding.source_link)
     await state.update_data(waiting_manual=False)
+
     await callback.message.answer(source_request_text(len(history)), parse_mode="Markdown")
 
 
-async def apply_service_choice(message: types.Message, state: FSMContext, chat_id: int, priority: str):
+async def apply_service_choice(
+    message: types.Message,
+    state: FSMContext,
+    chat_id: int,
+    priority: str
+):
     await run_sync(save_answer, chat_id, "priority_service", priority, timeout=10)
 
     await message.answer(
@@ -1826,6 +1948,7 @@ async def apply_service_choice(message: types.Message, state: FSMContext, chat_i
 @dp.callback_query(F.data.startswith("svc_"))
 async def service_chosen(callback: types.CallbackQuery, state: FSMContext):
     chat_id = callback.from_user.id
+
     if is_busy(chat_id):
         await callback.answer("Я ещё обрабатываю предыдущий шаг ⏳", show_alert=True)
         return
@@ -1871,31 +1994,50 @@ async def live_interview(message: types.Message, state: FSMContext):
         await state.clear()
         return
 
-    skip_words = ["не знаю", "пропустить", "незнаю", "пропусти", "дальше", "skip", "потом"]
+    skip_words = [
+        "не знаю", "пропустить", "незнаю",
+        "пропусти", "дальше", "skip", "потом"
+    ]
+
     if text.lower() in skip_words:
-        history.append({"q": question_number, "a": "Клиент пропустил вопрос / не знает"})
+        history.append({
+            "q": question_number,
+            "a": "Клиент пропустил вопрос / не знает"
+        })
+
         await state.update_data(
             history=history,
             awaiting_answer=False,
             last_question=None,
             last_question_num=None,
         )
-        await run_sync(save_answer, chat_id, f"Q{question_number}", "Пропущено", timeout=10)
+
+        await run_sync(
+            save_answer,
+            chat_id,
+            f"Q{question_number}",
+            "Пропущено",
+            timeout=10
+        )
+
         await message.answer("👌 Пропускаю этот вопрос.", parse_mode="Markdown")
 
         if question_number == 1:
             await schedule_background(chat_id, bg_after_first_answer, state)
         else:
             await schedule_background(chat_id, bg_ask_next_question, state)
+
         return
 
     history.append({"q": question_number, "a": text})
+
     await state.update_data(
         history=history,
         awaiting_answer=False,
         last_question=None,
         last_question_num=None,
     )
+
     await run_sync(save_answer, chat_id, f"Q{question_number}", text, timeout=10)
 
     if question_number == 1:
@@ -1915,6 +2057,7 @@ async def live_interview(message: types.Message, state: FSMContext):
 @dp.message(Onboarding.service_priority)
 async def service_priority_text(message: types.Message, state: FSMContext):
     chat_id = message.chat.id
+
     if is_busy(chat_id):
         await busy_answer(message)
         return
@@ -1969,8 +2112,12 @@ async def get_source(message: types.Message, state: FSMContext):
 
     if waiting_manual:
         src = (message.text or "").strip()
+
         if not src:
-            await message.answer("Пришли текст описанием, ценами и услугами.", reply_markup=get_main_menu())
+            await message.answer(
+                "Пришли текст описанием, ценами и услугами.",
+                reply_markup=get_main_menu(),
+            )
             return
 
         await message.answer("⏳ Изучаю присланный текст...", disable_notification=True)
@@ -1980,8 +2127,11 @@ async def get_source(message: types.Message, state: FSMContext):
     answer = (message.text or "").strip()
     await run_sync(save_answer, chat_id, "source_link", answer, timeout=10)
 
-    if answer.lower() in ["нет", "нету", "-", "0", "нет источника", "отсутствует"]:
+    if answer.lower() in [
+        "нет", "нету", "-", "0", "нет источника", "отсутствует"
+    ]:
         await message.answer("👌 Хорошо, работаем без внешних источников.", parse_mode="Markdown")
+
         await state.update_data(
             source_requested=True,
             source_data="",
@@ -1989,10 +2139,12 @@ async def get_source(message: types.Message, state: FSMContext):
             awaiting_answer=False,
         )
         await state.set_state(Onboarding.gathering)
+
         await schedule_background(chat_id, bg_ask_next_question, state)
         return
 
     urls = extract_urls(answer)
+
     if not urls:
         if answer.isdigit():
             urls = [f"https://www.avito.ru/user/{answer}/shop"]
@@ -2024,7 +2176,10 @@ async def get_source(message: types.Message, state: FSMContext):
 
 @dp.message(
     Onboarding.photos,
-    F.text.in_(["⏭ Пропустить", "Позже", "позже", "Не сейчас", "нет", "Нет", "пропустить"]),
+    F.text.in_([
+        "⏭ Пропустить", "Позже", "позже",
+        "Не сейчас", "нет", "Нет", "пропустить"
+    ]),
 )
 async def skip_photos(message: types.Message, state: FSMContext):
     await message.answer("👌 Ок, буду генерировать картинки сам.", parse_mode="Markdown")
@@ -2074,18 +2229,21 @@ async def ask_cta(message: types.Message, state: FSMContext):
             ],
         ]
     )
+
     await message.answer(
         "📍 **Куда тебе удобнее принимать заявки?**\n"
         "Я буду вставлять мягкий призыв в статьи.",
         reply_markup=kb,
         parse_mode="Markdown",
     )
+
     await state.set_state(Onboarding.cta_choice)
 
 
 @dp.callback_query(F.data.startswith("cta_"))
 async def cta_chosen(callback: types.CallbackQuery, state: FSMContext):
     chat_id = callback.from_user.id
+
     if is_busy(chat_id):
         await callback.answer("Подожди, я ещё обрабатываю предыдущий шаг ⏳", show_alert=True)
         return
@@ -2107,16 +2265,19 @@ async def cta_chosen(callback: types.CallbackQuery, state: FSMContext):
 
     await state.update_data(cta_type=ct)
     await state.set_state(Onboarding.cta_value)
+
     await callback.message.answer(
         f"✅ Выбрано: {ct}\n\n{prompts.get(ct, '')}",
         parse_mode="Markdown",
     )
+
     await callback.answer()
 
 
 @dp.message(Onboarding.cta_value)
 async def cta_value_received(message: types.Message, state: FSMContext):
     chat_id = message.chat.id
+
     if is_busy(chat_id):
         await busy_answer(message)
         return
@@ -2135,6 +2296,7 @@ async def cta_value_received(message: types.Message, state: FSMContext):
         parse_mode="Markdown",
         reply_markup=get_main_menu(),
     )
+
     await state.clear()
 
 
@@ -2145,18 +2307,22 @@ async def cta_value_received(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "vc_yes")
 async def cb_vc_yes(callback: types.CallbackQuery):
     chat_id = callback.from_user.id
+
     if is_busy(chat_id):
         await callback.answer("Я ещё обрабатываю предыдущий шаг ⏳", show_alert=True)
         return
 
     await callback.message.answer("⏳ Запускаю адаптацию под vc.ru...", disable_notification=True)
-    await schedule_background(chat_id, bg_adapt_vc, chat_id)
+    await schedule_background(chat_id, bg_adapt_vc)
     await callback.answer()
 
 
 @dp.callback_query(F.data == "vc_no")
 async def cb_vc_no(callback: types.CallbackQuery):
-    await callback.message.answer("👌 Ок, оставляем только версию для Дзена.", reply_markup=get_main_menu())
+    await callback.message.answer(
+        "👌 Ок, оставляем только версию для Дзена.",
+        reply_markup=get_main_menu(),
+    )
     await callback.answer()
 
 
@@ -2172,6 +2338,7 @@ async def cmd_admin(message: types.Message):
     try:
         u = supabase.table("users").select("id").execute()
         a = supabase.table("articles").select("id").execute()
+
         await message.answer(
             f"📊 **Статистика:**\n"
             f"👥 Клиентов: {len(u.data)}\n"
@@ -2194,7 +2361,9 @@ async def main():
     except Exception as e:
         logger.warning(f"⚠️ delete_webhook error: {e}")
 
-    await asyncio.sleep(2)
+    # Даём старой инстанции Render окончательно умереть.
+    await asyncio.sleep(5)
+
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
 
