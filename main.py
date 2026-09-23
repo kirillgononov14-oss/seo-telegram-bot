@@ -22,9 +22,6 @@ from supabase import create_client, Client
 from bs4 import BeautifulSoup
 from duckduckgo_search import DDGS
 from typing import Callable, Dict, Any, Optional, List
-from PIL import Image
-from io import BytesIO
-import feedparser 
 
 # =========================
 # CONFIG & INIT
@@ -263,7 +260,7 @@ class OnboardingStates(StatesGroup):
     photo_setup = State()       
     analyzing = State()         
     dashboard = State()         
-    editing_article = State()   # НОВОЕ СОСТОЯНИЕ ДЛЯ РУЧНОЙ ПРАВКИ
+    editing_article = State()   
 
 # =========================
 # BACKGROUND WORKERS
@@ -282,10 +279,7 @@ async def schedule_task(uid: int, func: Callable, *args, **kwargs):
     ACTIVE_TASKS[uid] = task
 
 async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_data: dict):
-    """
-    Главный мозг: Шпионаж + Анализ ЦА + Создание очереди идей.
-    """
-    await bot.send_message(chat_id, "🕵️♂️ **Запускаю глубокий шпионаж...**\nИзучаю конкурентов, анализирую боли ЦА и формирую стратегию.\nЭто займет 2-3 минуты.", disable_notification=True)
+    await bot.send_message(chat_id, "🕵️️ **Запускаю глубокий шпионаж...**\nИзучаю конкурентов, анализирую боли ЦА и формирую стратегию.\nЭто займет 2-3 минуты.", disable_notification=True)
     
     client_raw_data = ""
     if mode == "pilot":
@@ -365,7 +359,6 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
         
         strategy_id = res_strategy.data[0]['id']
         
-        # Парсим идеи (упрощенно для демо, создаем одну стартовую)
         supabase.table("article_ideas_queue").insert({
             "strategy_id": strategy_id,
             "topic_title": "Стартовая статья: Разбор главной боли ЦА",
@@ -672,10 +665,6 @@ async def cb_generate_next(callback: types.CallbackQuery, state: FSMContext):
     await schedule_task(uid, worker_produce_article, state, idea, idea_id)
 
 async def worker_produce_article(chat_id: int, state: FSMContext, idea: dict, idea_id: int):
-    """
-    Производство одной статьи: Текст + Визуал + Адаптации.
-    """
-    
     strat_res = supabase.table("market_strategies").select("tone_of_voice_guide, target_audience_profile").eq("user_id", chat_id).order("created_at", desc=True).limit(1).execute()
     context = ""
     if strat_res.data:
@@ -731,7 +720,6 @@ async def worker_produce_article(chat_id: int, state: FSMContext, idea: dict, id
         logger.error(f"Save article error: {e}")
         return
 
-    # Отправка результата пользователю с кнопками редактирования
     msg = f"✅ **СТАТЬЯ ГОТОВА!**\n\n"
     msg += f"📄 **Для Дзена:**\n{dzen_text[:500]}...\n\n"
     msg += f" **Заголовки:**\n{titles_res}\n\n"
@@ -757,7 +745,6 @@ async def cb_edit_manual(callback: types.CallbackQuery, state: FSMContext):
     article_id = int(callback.data.split("_")[2])
     uid = callback.from_user.id
     
-    # Получаем текущий текст
     try:
         res = supabase.table("published_articles").select("dzen_content").eq("id", article_id).single().execute()
         current_text = res.data["dzen_content"]
@@ -787,7 +774,6 @@ async def process_manual_edit(message: types.Message, state: FSMContext):
         await message.answer("Ошибка контекста. /start")
         return
         
-    # Сохраняем историю правок
     try:
         old_res = supabase.table("published_articles").select("dzen_content").eq("id", article_id).single().execute()
         old_text = old_res.data["dzen_content"]
@@ -800,14 +786,12 @@ async def process_manual_edit(message: types.Message, state: FSMContext):
             "new_content_snippet": new_text[:200]
         }).execute()
         
-        # Обновляем статью
         supabase.table("published_articles").update({
             "dzen_content": new_text,
             "version_status": "edited",
             "last_edit_time": str(datetime.now())
         }).eq("id", article_id).execute()
         
-        # Простое обновление счетчика
         cur_val = supabase.table("published_articles").select("edit_count").eq("id", article_id).single().execute().data["edit_count"]
         supabase.table("published_articles").update({"edit_count": cur_val + 1}).eq("id", article_id).execute()
         
@@ -828,7 +812,6 @@ async def cb_regen(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer("🔄 **Перегенерация...**\nПишу новый вариант статьи на основе той же темы.", disable_notification=True)
     
     try:
-        # Получаем идею
         art_res = supabase.table("published_articles").select("idea_id").eq("id", article_id).single().execute()
         idea_id = art_res.data["idea_id"]
         idea_res = supabase.table("article_ideas_queue").select("*").eq("id", idea_id).single().execute()
@@ -853,14 +836,12 @@ async def cb_regen(callback: types.CallbackQuery, state: FSMContext):
             await callback.message.answer("⚠️ Ошибка перегенерации.")
             return
             
-        # Обновляем статью в БД
         supabase.table("published_articles").update({
             "dzen_content": dzen_text,
             "version_status": "regenerated",
             "last_edit_time": str(datetime.now())
         }).eq("id", article_id).execute()
         
-        # Логируем
         supabase.table("article_edit_history").insert({
             "article_id": article_id,
             "user_id": uid,
@@ -870,8 +851,6 @@ async def cb_regen(callback: types.CallbackQuery, state: FSMContext):
         }).execute()
         
         await callback.message.answer("✅ Статья перегенерирована!\nНиже новый вариант.", reply_markup=get_menu())
-        
-        # Отправляем новый текст
         await send_long_bot(uid, f"📄 **НОВЫЙ ВАРИАНТ:**\n\n{dzen_text[:500]}...")
         
     except Exception as e:
@@ -898,15 +877,13 @@ async def cb_pub_tg(callback: types.CallbackQuery, state: FSMContext):
     article_id = int(callback.data.split("_")[2])
     uid = callback.from_user.id
     
-    # Здесь логика публикации в TG канал
-    # Пока заглушка
     await callback.message.answer("📢 Публикация в Telegram-канал...\n(Функция требует настройки токена канала)", reply_markup=get_menu())
 
 # =========================
-# COMMANDS & UTILS
+# COMMANDS & UTILS (FIXED SYNTAX)
 # =========================
 
-@dp.command("help")
+@dp.message(Command("help"))
 async def cmd_help(message: types.Message):
     await message.answer(
         "📋 **Команды:**\n"
@@ -917,7 +894,7 @@ async def cmd_help(message: types.Message):
         reply_markup=get_menu()
     )
 
-@dp.command("status")
+@dp.message(Command("status"))
 async def cmd_status(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     try:
