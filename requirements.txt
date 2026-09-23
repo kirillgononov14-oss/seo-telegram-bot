@@ -4,6 +4,3 @@ supabase
 beautifulsoup4
 lxml
 duckduckgo-search
-Pillow
-python-dotenv
-feedparser
