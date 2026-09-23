@@ -20,11 +20,16 @@ from aiogram.types import (
 )
 from supabase import create_client, Client
 from bs4 import BeautifulSoup
-# Используем современный импорт для DuckDuckGo
+
+# ИСПРАВЛЕННЫЙ ИМПОРТ ДЛЯ DUCKDUCKGO SEARCH
 try:
     from ddgs import DDGS
 except ImportError:
-    from duckduckgo_search import DDGS # Фолбэк на старое имя, если новое не установлено
+    try:
+        from duckduckgo_search import DDGS
+    except ImportError:
+        logger.error("❌ Neither 'ddgs' nor 'duckduckgo-search' found. Install one of them.")
+        raise
 
 from typing import Callable, Dict, Any, Optional, List
 
@@ -35,7 +40,7 @@ from typing import Callable, Dict, Any, Optional, List
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")
+SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY") # Или SERVICE_ROLE_KEY, если есть
 SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY")
 ADMIN_ID = 1847007101
 
@@ -65,7 +70,7 @@ DAILY_LIMIT = 3
 def register_user_safe(user_id: int, username: str = "", first_name: str = "") -> bool:
     """
     Гарантированно регистрирует пользователя.
-    После отключения RLS эта операция должна проходить успешно.
+    Работает только после отключения RLS в Supabase (Шаг 1).
     """
     try:
         data = {
@@ -1045,10 +1050,20 @@ def heartbeat():
 
 async def main():
     logger.info("🚀 Starting AUTONOMOUS AGENT V5...")
+    
+    # 1. Удаляем вебхук и сбрасываем обновления
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-    except: pass
-    await asyncio.sleep(2)
+    except Exception as e:
+        logger.warning(f"⚠️ delete_webhook error: {e}")
+    
+    # 2. ПАУЗА ДЛЯ ИЗБЕЖАНИЯ КОНФЛИКТА BOT INSTANCES
+    # Render может быстро перезапускать сервис. Старый процесс умирает,
+    # но Telegram еще держит соединение. Ждем 10 секунд, чтобы гарантировать чистый старт.
+    logger.info("⏳ Waiting 10 seconds to avoid Telegram conflict...")
+    await asyncio.sleep(10)
+    
+    # 3. Запускаем polling
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
 if __name__ == "__main__":
