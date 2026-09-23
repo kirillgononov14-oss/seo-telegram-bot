@@ -51,7 +51,29 @@ BANNED_NICHES = ["обнал", "отмыв", "адалт", "18+", "порн", "�
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 MODELS = ["qwen/qwen3.8-27b"] 
 
-DAILY_LIMIT = 3 # Максимум статей в день
+DAILY_LIMIT = 3 
+
+# =========================
+# DATABASE HELPERS
+# =========================
+
+def ensure_user_exists(user_id: int, username: str = "", first_name: str = ""):
+    """Проверяет наличие пользователя в БД и создает его, если нет."""
+    try:
+        # Проверяем, есть ли уже такой ID
+        res = supabase.table("users").select("*").eq("id", user_id).execute()
+        if not res.data:
+            # Создаем нового пользователя
+            supabase.table("users").insert({
+                "id": user_id,
+                "username": username or "",
+                "first_name": first_name or ""
+            }).execute()
+            logger.info(f"🆕 Created new user in DB: {user_id}")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Error ensuring user exists: {e}")
+        return False
 
 # =========================
 # PROMPTS ENGINE
@@ -279,7 +301,7 @@ async def schedule_task(uid: int, func: Callable, *args, **kwargs):
     ACTIVE_TASKS[uid] = task
 
 async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_data: dict):
-    await bot.send_message(chat_id, "🕵️️ **Запускаю глубокий шпионаж...**\nИзучаю конкурентов, анализирую боли ЦА и формирую стратегию.\nЭто займет 2-3 минуты.", disable_notification=True)
+    await bot.send_message(chat_id, "🕵️♂️ **Запускаю глубокий шпионаж...**\nИзучаю конкурентов, анализирую боли ЦА и формирую стратегию.\nЭто займет 2-3 минуты.", disable_notification=True)
     
     client_raw_data = ""
     if mode == "pilot":
@@ -347,6 +369,16 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
         await bot.send_message(chat_id, "⚠️ Ошибка анализа. Попробуй позже.", reply_markup=get_menu())
         return
 
+    # --- ВАЖНОЕ ИСПРАВЛЕНИЕ: Регистрация пользователя перед сохранением ---
+    # Получаем данные юзера из контекста сообщения (если возможно) или используем заглушку
+    # Так как мы в фоновом потоке, у нас нет объекта message.from_user напрямую, 
+    # но chat_id это и есть user_id в Telegram.
+    
+    user_registered = ensure_user_exists(chat_id)
+    if not user_registered:
+         await bot.send_message(chat_id, "❌ Критическая ошибка базы данных. Пользователь не создан.")
+         return
+
     try:
         res_strategy = supabase.table("market_strategies").insert({
             "user_id": chat_id,
@@ -370,7 +402,7 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
         
     except Exception as e:
         logger.error(f"DB save error: {e}")
-        await bot.send_message(chat_id, "❌ Ошибка сохранения данных.")
+        await bot.send_message(chat_id, f"❌ Ошибка сохранения данных: {str(e)[:100]}")
         return
 
     await state.update_data(strategy_id=strategy_id, niche=niche_keyword)
@@ -424,6 +456,9 @@ async def send_long_bot(chat_id: int, text: str, reply_markup=None):
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
+    
+    # Регистрируем пользователя сразу при старте
+    ensure_user_exists(message.from_user.id, message.from_user.username, message.from_user.first_name)
     
     kb_choice = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🌐 ЕСТЬ ССЫЛКИ (Автопилот)", callback_data="mode_pilot")],
@@ -566,6 +601,9 @@ async def cb_use_ai_gen(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
     uid = callback.from_user.id
     
+    # Убеждаемся, что пользователь есть в БД
+    ensure_user_exists(uid)
+    
     try:
         supabase.table("user_settings").upsert({
             "user_id": uid,
@@ -585,6 +623,8 @@ async def handle_disk_url(message: types.Message, state: FSMContext):
         await message.answer("Это не ссылка на Яндекс.Диск. Проверь адрес.")
         return
         
+    ensure_user_exists(uid)
+    
     try:
         supabase.table("user_settings").upsert({
             "user_id": uid,
