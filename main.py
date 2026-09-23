@@ -159,6 +159,19 @@ IMAGE_GEN_SYSTEM = BASE_SYSTEM + """
 ЗАДАЧА: Создать промпт для нейросети для генерации обложки.
 Ответь только английским промптом. Стиль: Профессиональная фотография, высокое разрешение."""
 
+# --- ВОССТАНОВЛЕННАЯ ПЕРЕМЕННАЯ ДЛЯ ЗАГОЛОВКОВ ---
+TITLE_GEN_SYSTEM = BASE_SYSTEM + """
+
+ЗАДАЧА: Придумать 3 варианта заголовка для статьи.
+1. [A] Кликбейтный (вызывает сильное любопытство, но честный).
+2. [B] Экспертный (решает конкретную проблему, вызывает доверие).
+3. [C] Вопросительный (цепляет боль напрямую).
+
+Формат вывода:
+A: ...
+B: ...
+C: ..."""
+
 # =========================
 # HELPER FUNCTIONS
 # =========================
@@ -242,9 +255,6 @@ def detect_source_type(url: str) -> str:
     return "site"
 
 def parse_generic_site(url: str) -> tuple[Optional[str], str]:
-    """
-    Возвращает (текст, статус_сообщение)
-    """
     html = scrape_with_api(url, premium=False, render=True)
     if not html:
         return None, "⚠️ Не удалось открыть сайт (таймаут или блокировка)."
@@ -341,7 +351,7 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
     await bot.send_message(chat_id, "🕵️♂️ **Запускаю глубокий шпионаж...**\nИзучаю конкурентов, анализирую боли ЦА и формирую стратегию.\nЭто займет 2-3 минуты.", disable_notification=True)
     
     client_raw_data = ""
-    parsing_report_lines = [] # Собираем отчет
+    parsing_report_lines = [] 
     
     if mode == "pilot":
         links = input_data.get("links", [])
@@ -402,7 +412,6 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
             elif stype == "max":
                  parsing_report_lines.append(f"📱 МАХ: ℹ️ Автоматический парсинг МАХ пока ограничен API. Буду использовать общие знания ниши.") 
     
-    # Отправляем отчет пользователю ПЕРЕД началом анализа LLM
     if parsing_report_lines:
         report_text = "📊 **Отчет по твоим источникам:**\n\n" + "\n".join(parsing_report_lines)
         await bot.send_message(chat_id, report_text, disable_notification=True)
@@ -457,6 +466,7 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
              
         strategy_id = res_strategy.data[0]['id']
         
+        # Создаем первую идею
         supabase.table("article_ideas_queue").insert({
             "strategy_id": strategy_id,
             "topic_title": "Стартовая статья: Разбор главной боли ЦА",
@@ -499,8 +509,8 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
 def get_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📊 Мой Дашборд"), KeyboardButton(text="🚀 Следующая статья")],
-            [KeyboardButton(text="ℹ️ Статус (/status)"), KeyboardButton(text="❓ Помощь")]
+            [KeyboardButton(text="📋 Мои задачи"), KeyboardButton(text="🚀 Новая статья")],
+            [KeyboardButton(text="⏳ Где мой текст?"), KeyboardButton(text="❓ Помощь")]
         ],
         resize_keyboard=True,
         input_field_placeholder="Выбери действие..."
@@ -676,12 +686,22 @@ async def cb_use_ai_gen(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
     uid = callback.from_user.id
     
+    # ИСПРАВЛЕНИЕ: Правильный способ upsert/update settings
     try:
-        supabase.table("user_settings").upsert({
-            "user_id": uid,
+        # Сначала пробуем обновить
+        update_res = supabase.table("user_settings").update({
             "use_generated_images": True,
             "yandex_disk_folder_url": None
         }).eq("user_id", uid).execute()
+        
+        # Если ничего не обновилось (нет записи), создаем новую
+        if not update_res.data:
+            supabase.table("user_settings").insert({
+                "user_id": uid,
+                "use_generated_images": True,
+                "yandex_disk_folder_url": None
+            }).execute()
+            
     except Exception as e:
         logger.error(f"Settings save error: {e}")
     
@@ -697,11 +717,19 @@ async def handle_disk_url(message: types.Message, state: FSMContext):
         return
         
     try:
-        supabase.table("user_settings").upsert({
-            "user_id": uid,
+        # ИСПРАВЛЕНИЕ: Аналогично выше
+        update_res = supabase.table("user_settings").update({
             "use_generated_images": False,
             "yandex_disk_folder_url": url
         }).eq("user_id", uid).execute()
+        
+        if not update_res.data:
+            supabase.table("user_settings").insert({
+                "user_id": uid,
+                "use_generated_images": False,
+                "yandex_disk_folder_url": url
+            }).execute()
+            
     except Exception as e:
         logger.error(f"Save settings error: {e}")
         
@@ -713,30 +741,33 @@ async def show_dashboard(message: types.Message, state: FSMContext, uid: int):
     await state.set_state(OnboardingStates.dashboard)
     
     try:
+        # Получаем следующую необработанную идею
         ideas_res = supabase.table("article_ideas_queue").select("*").eq("is_processed", False).order("relevance_score", desc=True).limit(1).execute()
         next_idea = ideas_res.data[0] if ideas_res.data else None
         
-        articles_today = supabase.table("published_articles").select("*").filter("publication_date", "gte", str(date.today())).eq("user_id", uid).count().execute()
-        count_today = articles_today.count if articles_today.count else 0
+        # ИСПРАВЛЕНИЕ: Правильный подсчет количества
+        today_str = str(date.today())
+        articles_res = supabase.table("published_articles").select("*", count="exact").filter("publication_date", "gte", today_str).eq("user_id", uid).execute()
+        count_today = articles_res.count if articles_res.count else 0
+        
     except Exception as e:
         logger.error(f"Dashboard load error: {e}")
         next_idea = None
         count_today = 0
         
-    msg = f"📊 **МОЙ ДАШБОРД**\n\n"
+    msg = f"📋 **МОИ ЗАДАЧИ**\n\n"
     msg += f" **Статус:** Активен\n"
-    msg += f"🔹 **Опубликовано сегодня:** {count_today}/{DAILY_LIMIT}\n"
+    msg += f"🔹 **Написано сегодня:** {count_today}/{DAILY_LIMIT}\n"
     
     if next_idea:
         msg += f"\n🚀 **Следующая тема:**\n\"{next_idea['topic_title']}\"\n"
         msg += f"💥 **Боль ЦА:** {next_idea['pain_point']}\n"
+        msg += "\nНажми 🚀 **Новая статья**, чтобы начать производство."
     else:
-        msg += "\n⚠️ **Очередь идей пуста.** Нужно обновить стратегию.\n"
+        msg += "\n⚠️ **Очередь идей пуста.** Нужно обновить стратегию (/start).\n"
         
-    msg += "\nНажми 🚀 **Следующая статья**, чтобы начать производство."
-    
     kb_dash = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚀 Следующая статья", callback_data="generate_next_article")],
+        [InlineKeyboardButton(text="🚀 Новая статья", callback_data="generate_next_article")],
         [InlineKeyboardButton(text="⚙️ Настройки каналов", callback_data="setup_channels")],
         [InlineKeyboardButton(text="📥 Скачать архив", callback_data="download_archive")]
     ])
@@ -748,10 +779,13 @@ async def cb_generate_next(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
     uid = callback.from_user.id
     
-    # Проверка лимита
+    # ИСПРАВЛЕНИЕ: Проверка лимита с правильным счетчиком
     try:
-        articles_today = supabase.table("published_articles").select("*").filter("publication_date", "gte", str(date.today())).eq("user_id", uid).count().execute()
-        if articles_today.count >= DAILY_LIMIT:
+        today_str = str(date.today())
+        articles_res = supabase.table("published_articles").select("*", count="exact").filter("publication_date", "gte", today_str).eq("user_id", uid).execute()
+        current_count = articles_res.count if articles_res.count else 0
+        
+        if current_count >= DAILY_LIMIT:
             await callback.message.answer(f"⛔ **Лимит исчерпан.**\nМаксимум {DAILY_LIMIT} статьи в день. Жди завтра!")
             return
     except: pass
@@ -777,9 +811,6 @@ async def cb_generate_next(callback: types.CallbackQuery, state: FSMContext):
     await schedule_task(uid, worker_produce_article, state, idea, idea_id)
 
 async def worker_produce_article(chat_id: int, state: FSMContext, idea: dict, idea_id: int):
-    """
-    Производство одной статьи с детализацией процесса и таймаутами.
-    """
     start_time = time.time()
     TASK_STATUS[chat_id] = "Generating Article..."
     
@@ -806,7 +837,7 @@ async def worker_produce_article(chat_id: int, state: FSMContext, idea: dict, id
         if not dzen_text:
             raise Exception("Failed to generate main text")
             
-        # Шаг 2: Заголовки
+        # Шаг 2: Заголовки (ИСПОЛЬЗУЕМ TITLE_GEN_SYSTEM)
         await bot.send_message(chat_id, "🔖 Этап 2/4: Генерирую варианты заголовков...", disable_notification=True)
         titles_prompt = f"Придумай 3 заголовка для этой статьи:\n{dzen_text[:500]}..."
         titles_res = await agroq(titles_prompt, max_tokens=200, system=TITLE_GEN_SYSTEM, timeout=30)
@@ -1029,22 +1060,22 @@ async def cmd_help(message: types.Message):
     )
 
 @dp.message(Command("status"))
-@dp.message(F.text == "ℹ️ Статус (/status)")
+@dp.message(F.text == "⏳ Где мой текст?")
 async def cmd_status(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     current_state = await state.get_state()
     task_status = TASK_STATUS.get(uid, "Idle")
     is_busy = uid in ACTIVE_TASKS and not ACTIVE_TASKS[uid].done()
     
-    status_msg = f"🧠 **Статус агента:**\n\n"
-    status_msg += f"🔹 **FSM Состояние:** `{current_state or 'None'}`\n"
+    status_msg = f"🧠 **Процесс работы агента:**\n\n"
+    status_msg += f"🔹 **Текущее состояние:** `{current_state or 'None'}`\n"
     status_msg += f"🔹 **Фоновая задача:** {'🟢 РАБОТАЕТ' if is_busy else '⚪ СВОБОДНА'}\n"
-    status_msg += f"🔹 **Текущий этап:** `{task_status}`\n"
+    status_msg += f"🔹 **Этап выполнения:** `{task_status}`\n"
     
     if is_busy:
-        status_msg += "\n⏳ Подожди завершения операции. Максимум 5 минут."
+        status_msg += "\n⏳ Агент пишет текст. Подожди завершения операции. Максимум 5 минут."
     else:
-        status_msg += "\n✅ Можно продолжать работу."
+        status_msg += "\n✅ Агент свободен. Можешь нажать '🚀 Новая статья' или посмотреть дашборд."
         
     await message.answer(status_msg, reply_markup=get_menu())
 
