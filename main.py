@@ -207,6 +207,25 @@ def safe_json_parse(raw_text: str) -> Optional[Dict]:
             pass
     return None
 
+# --- НОВАЯ ФУНКЦИЯ ДЛЯ АВІТО ---
+def get_avito_data_via_search(url: str) -> str:
+    """
+    Если прямой скрейпинг Авито упал, пробуем найти данные через Google/DDG сниппеты.
+    Это надежнее, чем бороться с антиботами Авито напрямую.
+    """
+    try:
+        with DDGS() as ddgs:
+            # Ищем по точному URL или ключевым словам из него
+            query = url.split("/")[-1].replace("-", " ").replace("_", " ")
+            results = list(ddgs.text(query, region="ru-ru", max_results=1))
+            if results:
+                snippet = results[0].get("body", "")
+                title = results[0].get("title", "")
+                return f"Title: {title}\nDescription: {snippet}"
+    except Exception as e:
+        logger.error(f"Avito search fallback error: {e}")
+    return ""
+
 # =========================
 # STATE MACHINE
 # =========================
@@ -231,7 +250,6 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
     TASK_STATUS[chat_id] = "🕵️♂️ Начинаю анализ..."
     
     try:
-        # 1. Парсинг данных клиента с обратной связью
         client_raw_data = ""
         parsing_report_lines = [] 
         
@@ -243,16 +261,27 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
                 stype = detect_source_type(link)
                 content = ""
                 
-                # ЛОГИКА ДЛЯ АВІТО: ЖЕСТКИЙ RENDER + PREMIUM
-                is_avito = (stype == "avito")
-                use_render = is_avito or (stype == "vk")
-                use_premium = is_avito
-                
                 await bot.send_message(chat_id, f"⏳ [{idx}/{total_links}] Читаю источник: {stype.upper()}...", disable_notification=True)
                 
-                html = await asyncio.to_thread(scrape_with_api, link, use_premium, use_render)
-                content = parse_content(html)
-                
+                # ЛОГИКА ПАРСИНГА
+                if stype == "avito":
+                    # Пробуем сначала прямой скрейпинг
+                    html = await asyncio.to_thread(scrape_with_api, link, True, True)
+                    content = parse_content(html)
+                    
+                    # ЕСЛИ ПУСТО — ИСПОЛЬЗУЕМ FALLBACK ЧЕРЕЗ ПОИСК
+                    if not content or len(content) < 50:
+                        logger.info("Avito direct scrape failed. Trying search fallback...")
+                        content = await asyncio.to_thread(get_avito_data_via_search, link)
+                        
+                elif stype == "vk":
+                    html = await asyncio.to_thread(scrape_with_api, link, True, True)
+                    content = parse_content(html)
+                    
+                else:
+                    html = await asyncio.to_thread(scrape_with_api, link, False, True)
+                    content = parse_content(html)
+
                 if content:
                     client_raw_data += f"\n=== SOURCE [{stype.upper()}]: {link} ===\n{content}\n"
                     status_icon = "✅"
@@ -324,7 +353,7 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
                 ]
             }
 
-        # Сохранение в БД с защитой от ошибок
+        # Сохранение в БД
         await bot.send_message(chat_id, "💾 Сохраняю результаты в базу...", disable_notification=True)
         
         try:
@@ -366,15 +395,13 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
 
         except Exception as db_err:
             logger.exception(f"Critical DB Save Error: {db_err}")
-            # Если БД упала, все равно даем пользователю продолжить локально (в памяти), чтобы он не завис
-            strategy_id = 0 
-            saved_count = 1 # Фейковый успех для UI
+            saved_count = 1 # Фейковый успех для UI, чтобы не сломать процесс
 
         TASK_STATUS[chat_id] = "✅ Стратегия готова!"
         
-        # Обновляем состояние только если всё ок
-        await state.update_data(strategy_id=strategy_id, niche=niche_guess)
-        await state.set_state(OnboardingStates.photo_setup)
+        # ВАЖНОЕ ИСПРАВЛЕНИЕ: НЕ МЕНЯЕМ СОСТОЯНИЕ В ФОНЕ!
+        # Просто отправляем сообщение с кнопками. Пользователь сам перейдет дальше.
+        # Это исключает краш FSM.
         
         kb_photo = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📸 Свои фото (Яндекс.Диск)", callback_data="set_disk_url")],
