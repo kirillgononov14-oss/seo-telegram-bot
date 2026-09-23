@@ -59,12 +59,11 @@ except Exception as e:
 
 BANNED_NICHES = ["обнал", "отмыв", "адалт", "18+", "порн", "оружие", "наркот", "взлом", "хакер"]
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODELS = ["llama-3.3-70b-versatile"] # Более надежная модель чем qwen для сложных задач
+MODELS = ["llama-3.3-70b-versatile"] # Используем самую стабильную модель для JSON
 
 DAILY_LIMIT = 3 
 GLOBAL_TIMEOUT_SEC = 300 
 
-# Глобальный словарь статусов для быстрого доступа командой /status
 ACTIVE_TASKS: Dict[int, asyncio.Task] = {}
 TASK_STATUS: Dict[int, str] = {} 
 
@@ -90,7 +89,8 @@ BASE_SYSTEM = """Ты — элитный SEO-стратег. Пиши на ру�
 
 SPY_SYSTEM = BASE_SYSTEM + """
 ЗАДАЧА: Анализ рынка.
-ВЫВЕДИ JSON:
+ВЫВЕДИ СТРОГО ВАЛИДНЫЙ JSON БЕЗ ДОПОЛНИТЕЛЬНЫХ ТЕКСТОВ ПЕРЕД ИЛИ ПОСЛЕ.
+ФОРМАТ:
 {
   "niche_keyword": "...",
   "competitors_weaknesses": ["...", "..."],
@@ -127,7 +127,6 @@ IMAGE_GEN_SYSTEM = BASE_SYSTEM + """
 # =========================
 
 def normalize_vk_url(url: str) -> str:
-    """Приводит vk.ru и другие варианты к m.vk.com для лучшего парсинга"""
     u = url.lower()
     if "vk.com" in u:
         return u.replace("vk.com", "m.vk.com")
@@ -140,11 +139,10 @@ def scrape_with_api(url: str, premium: bool = False, render: bool = False) -> Op
         logger.warning("No Scraper API Key")
         return None
     
-    # Нормализация URL специально для VK
     final_url = url
     if "vk." in url:
         final_url = normalize_vk_url(url)
-
+    
     params = {"api_key": SCRAPER_API_KEY, "url": final_url, "country_code": "ru"}
     if premium: params["premium"] = "true"
     if render: params["render"] = "true"
@@ -196,6 +194,26 @@ async def agroq(prompt: str, max_tokens: int = 1200, system: Optional[str] = Non
         logger.error(f"Groq Async Error: {e}")
     return None
 
+def safe_json_parse(raw_text: str) -> Optional[Dict]:
+    """Пытается распарсить JSON из текста, очищая его от мусора."""
+    if not raw_text: return None
+    
+    # Удаляем markdown блоки ```json ... ```
+    cleaned = raw_text.replace("```json", "").replace("```", "").strip()
+    
+    # Ищем первый '{' и последний '}'
+    start_idx = cleaned.find('{')
+    end_idx = cleaned.rfind('}')
+    
+    if start_idx != -1 and end_idx != -1:
+        json_str = cleaned[start_idx:end_idx+1]
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            pass
+            
+    return None
+
 # =========================
 # STATE MACHINE
 # =========================
@@ -220,7 +238,6 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
     TASK_STATUS[chat_id] = "🕵️♂️ Изучаю источники..."
     
     try:
-        # 1. Парсинг данных клиента
         client_raw_data = ""
         parsing_report_lines = [] 
         
@@ -230,39 +247,21 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
                 stype = detect_source_type(link)
                 content = ""
                 
-                if stype == "site":
-                    html = await asyncio.to_thread(scrape_with_api, link, False, True)
-                    content = parse_content(html)
-                    status = "✅ Сайт изучен" if content else "⚠️ Пусто/Ошибка"
-                    parsing_report_lines.append(f"🌐 Сайт: {status} ({len(content)} зн.)")
-                    
-                elif stype == "avito":
-                    html = await asyncio.to_thread(scrape_with_api, link, True, True)
-                    content = parse_content(html)
-                    status = "✅ Объявление прочитано" if content else "⚠️ Мало данных"
-                    parsing_report_lines.append(f"✈️ Авито: {status} ({len(content)} зн.)")
-                    
-                elif stype == "vk":
-                    # Специальная обработка VK через нормализацию
-                    html = await asyncio.to_thread(scrape_with_api, link, True, True)
-                    content = parse_content(html)
-                    status = "✅ Группа изучена" if content else "❌ Блокировка/VK требует вход"
-                    parsing_report_lines.append(f"💬 ВК: {status} ({len(content)} зн.)")
-                    
-                elif stype == "telegram":
-                    ch = link.split("/")[-1]
-                    pub_link = f"https://t.me/s/{ch}"
-                    html = await asyncio.to_thread(scrape_with_api, pub_link, False, False)
-                    soup = BeautifulSoup(html or "", "lxml")
-                    posts = [p.get_text(strip=True) for p in soup.find_all("div", class_="tgme_widget_message_text")]
-                    content = "\n".join(posts[:5])
-                    status = "✅ Канал прочитан" if content else "⚠️ Публичная версия недоступна"
-                    parsing_report_lines.append(f"📢 TG: {status} ({len(content)} зн.)")
+                # ДЛЯ АВІТО ОБЯЗАТЕЛЬНО RENDER=True
+                is_avito = (stype == "avito")
+                is_render_required = is_avito or (stype == "vk")
+                
+                html = await asyncio.to_thread(scrape_with_api, link, True, is_render_required)
+                content = parse_content(html)
                 
                 if content:
                     client_raw_data += f"\n=== SOURCE [{stype.upper()}]: {link} ===\n{content}\n"
+                    status_icon = "✅"
+                else:
+                    status_icon = "⚠️"
+                    
+                parsing_report_lines.append(f"{status_icon} {stype.upper()}: ({len(content)} зн.)")
 
-        # Отправляем отчет пользователю сразу, чтобы он видел прогресс
         if parsing_report_lines:
             report_text = "📊 **Отчет по твоим источникам:**\n\n" + "\n".join(parsing_report_lines)
             await bot.send_message(chat_id, report_text)
@@ -270,12 +269,10 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
         if not client_raw_data:
             client_raw_data = input_data.get("description", "Нет данных.")
 
-        TASK_STATUS[chat_id] = "🧠 Анализирую рынок и конкурентов..."
+        TASK_STATUS[chat_id] = "🧠 Анализирую рынок..."
         
-        # 2. Поиск конкурентов
         niche_guess = input_data.get("keyword_guess", "")
         if not niche_guess:
-            # Быстрый запрос на определение ниши
             niche_def = await agroq(f"Определи одно ключевое слово для SEO бизнеса:\n{client_raw_data[:1000]}", max_tokens=20, system=BASE_SYSTEM)
             niche_guess = niche_def.strip().lower() if niche_def else "услуги"
 
@@ -289,12 +286,12 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
         except: pass
 
         comp_analysis_text = ""
-        for i, comp in enumerate(competitors[:2]): # Берем топ-2 для скорости
+        for i, comp in enumerate(competitors[:2]):
             c_html = await asyncio.to_thread(scrape_with_api, comp['url'], False, True)
             c_content = parse_content(c_html)
             comp_analysis_text += f"\nКОНКУРЕНТ {i+1} ({comp['title']}):\n{c_content[:1000]}"
 
-        TASK_STATUS[chat_id] = "📝 Генерирую стратегию статей..."
+        TASK_STATUS[chat_id] = "📝 Генерирую стратегию..."
 
         spy_prompt = f"""
 ДАННЫЕ КЛИЕНТА:
@@ -309,18 +306,22 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
 """
         raw_json_response = await agroq(spy_prompt, max_tokens=2000, system=SPY_SYSTEM, timeout=90)
         
-        if not raw_json_response:
-            raise Exception("LLM failed to generate strategy")
+        # --- ЖЕСТКАЯ ЗАЩИТА ОТ ОШИБОК ПАРСИНГА ---
+        strategy_data = safe_json_parse(raw_json_response)
+        
+        if not strategy_data:
+            logger.warning("LLM returned invalid JSON. Using fallback strategy.")
+            # Создаем запасную идею, чтобы бот не упал
+            strategy_data = {
+                "niche_keyword": niche_guess,
+                "competitors_weaknesses": ["Высокие цены", "Долгие сроки"],
+                "audience_pains": ["Недоверие к качеству", "Страх переплатить"],
+                "article_ideas": [
+                    {"topic": "Как выбрать надежного подрядчика", "pain_point": "Страх обмана", "weakness_to_hammer": "Прозрачность сметы", "score": 10.0}
+                ]
+            }
 
-        # Парсим JSON (очищаем от markdown блоков если есть)
-        clean_json = raw_json_response.replace("```json", "").replace("```", "").strip()
-        try:
-            strategy_data = json.loads(clean_json)
-        except:
-            # Если JSON битый, сохраняем как текст fallback
-            strategy_data = {"raw_text": raw_json_response, "article_ideas": []}
-
-        # 3. Сохранение в БД
+        # Сохранение в БД
         res_strategy = supabase.table("market_strategies").insert({
             "user_id": chat_id,
             "niche_keyword": niche_guess,
@@ -336,7 +337,7 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
         if not ideas:
             ideas = [{"topic": "Стартовая статья", "pain_point": "Боль клиента", "weakness_to_hammer": "Слабость конкурента", "score": 10.0}]
 
-        for idea in ideas[:5]: # Создаем первые 5 идей
+        for idea in ideas[:5]:
             supabase.table("article_ideas_queue").insert({
                 "strategy_id": strategy_id,
                 "topic_title": idea.get("topic", "Новая тема"),
@@ -348,7 +349,6 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
 
         TASK_STATUS[chat_id] = "✅ Стратегия готова!"
         
-        # Переход к настройке фото
         await state.update_data(strategy_id=strategy_id, niche=niche_guess)
         await state.set_state(OnboardingStates.photo_setup)
         
@@ -514,7 +514,6 @@ async def pilot_get_links(message: types.Message, state: FSMContext):
 
     input_data = {"links": urls, "description": message.text, "keyword_guess": ""}
     
-    # Запускаем фон
     task = asyncio.create_task(worker_market_spy(uid, state, "pilot", input_data))
     ACTIVE_TASKS[uid] = task
     TASK_STATUS[uid] = "Started"
@@ -628,13 +627,11 @@ async def cb_generate(cb: types.CallbackQuery, s: FSMContext):
     await cb.answer()
     uid = cb.from_user.id
     
-    # Лимит
     today_str = str(date.today())
     arts_res = supabase.table("published_articles").select("*", count="exact").filter("publication_date", "gte", today_str).eq("user_id", uid).execute()
     if arts_res.count >= DAILY_LIMIT:
         await cb.message.answer("⛔ Лимит исчерпан."); return
     
-    # Взять идею
     ideas_res = supabase.table("article_ideas_queue").select("*").eq("is_processed", False).order("relevance_score", desc=True).limit(1).execute()
     if not ideas_res.data:
         await cb.message.answer("❌ Нет идей."); return
@@ -786,7 +783,7 @@ async def main():
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except: pass
-    await asyncio.sleep(5) # Пауза меньше, т.к. мы оптимизировали старт
+    await asyncio.sleep(5)
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
 if __name__ == "__main__":
