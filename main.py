@@ -28,7 +28,7 @@ except ImportError:
     try:
         from duckduckgo_search import DDGS
     except ImportError:
-        logger.error("❌ Neither 'ddgs' nor 'duckduckgo-search' found. Install one of them.")
+        logger.error("❌ Neither 'ddgs' nor 'duckduckgo-search' found.")
         raise
 
 from typing import Callable, Dict, Any, Optional, List
@@ -40,7 +40,7 @@ from typing import Callable, Dict, Any, Optional, List
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY") # Или SERVICE_ROLE_KEY, если есть
+SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")
 SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY")
 ADMIN_ID = 1847007101
 
@@ -62,39 +62,29 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 MODELS = ["qwen/qwen3.8-27b"] 
 
 DAILY_LIMIT = 3 
+GLOBAL_TIMEOUT_SEC = 300 # 5 минут макс на одну статью
 
 # =========================
 # DATABASE HELPERS (SAFE)
 # =========================
 
 def register_user_safe(user_id: int, username: str = "", first_name: str = "") -> bool:
-    """
-    Гарантированно регистрирует пользователя.
-    Работает только после отключения RLS в Supabase (Шаг 1).
-    """
     try:
         data = {
             "id": user_id,
             "username": username or "",
             "first_name": first_name or ""
         }
-        
-        # Upsert: если есть - обновляет, если нет - создает
         res = supabase.table("users").upsert(data).execute()
-        
         if res.data:
             logger.info(f"🆕 User registered/updated: {user_id}")
             return True
         else:
-            # Если upsert вернул пусто, проверяем вручную
             check = supabase.table("users").select("*").eq("id", user_id).execute()
             if check.data:
                 logger.info(f"✅ User already exists: {user_id}")
                 return True
-            
-        logger.warning(f"⚠️ Upsert returned no data for user {user_id}")
         return False
-        
     except Exception as e:
         logger.error(f"❌ CRITICAL DB ERROR registering user {user_id}: {e}")
         return False
@@ -313,9 +303,11 @@ class OnboardingStates(StatesGroup):
 # =========================
 
 ACTIVE_TASKS: Dict[int, asyncio.Task] = {}
+TASK_STATUS: Dict[int, str] = {} # Для отслеживания статуса
 
 async def cancel_task(uid: int):
     task = ACTIVE_TASKS.pop(uid, None)
+    TASK_STATUS.pop(uid, None)
     if task and not task.done():
         task.cancel()
 
@@ -323,16 +315,20 @@ async def schedule_task(uid: int, func: Callable, *args, **kwargs):
     await cancel_task(uid)
     task = asyncio.create_task(func(uid, *args, **kwargs))
     ACTIVE_TASKS[uid] = task
+    TASK_STATUS[uid] = "Started"
+    return task
 
 async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_data: dict):
-    # 1. Проверка наличия пользователя
+    TASK_STATUS[chat_id] = "Spying..."
+    
     user_check = supabase.table("users").select("id").eq("id", chat_id).execute()
     if not user_check.data:
         logger.error(f"❌ USER MISSING IN DB during spy work: {chat_id}")
         await bot.send_message(chat_id, "❌ Критическая ошибка: Пользователь не найден в базе. Напиши /start заново.")
+        TASK_STATUS[chat_id] = "Error: No User"
         return
 
-    await bot.send_message(chat_id, "🕵️️ **Запускаю глубокий шпионаж...**\nИзучаю конкурентов, анализирую боли ЦА и формирую стратегию.\nЭто займет 2-3 минуты.", disable_notification=True)
+    await bot.send_message(chat_id, "🕵️♂️ **Запускаю глубокий шпионаж...**\nИзучаю конкурентов, анализирую боли ЦА и формирую стратегию.\nЭто займет 2-3 минуты.", disable_notification=True)
     
     client_raw_data = ""
     if mode == "pilot":
@@ -398,10 +394,10 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
 
     if not spy_report:
         await bot.send_message(chat_id, "⚠️ Ошибка анализа. Попробуй позже.", reply_markup=get_menu())
+        TASK_STATUS[chat_id] = "Error: Analysis Failed"
         return
 
     try:
-        # Сохраняем стратегию
         res_strategy = supabase.table("market_strategies").insert({
             "user_id": chat_id,
             "niche_keyword": niche_keyword,
@@ -416,7 +412,6 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
              
         strategy_id = res_strategy.data[0]['id']
         
-        # Создаем первую идею
         supabase.table("article_ideas_queue").insert({
             "strategy_id": strategy_id,
             "topic_title": "Стартовая статья: Разбор главной боли ЦА",
@@ -429,6 +424,7 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
     except Exception as e:
         logger.error(f"DB save error in spy: {e}")
         await bot.send_message(chat_id, f"❌ Ошибка сохранения стратегии: {str(e)[:100]}")
+        TASK_STATUS[chat_id] = "Error: DB Save"
         return
 
     await state.update_data(strategy_id=strategy_id, niche=niche_keyword)
@@ -449,6 +445,7 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
         "Выбери вариант:",
         reply_markup=kb_photo
     )
+    TASK_STATUS[chat_id] = "Waiting for Photo Choice"
 
 # =========================
 # UI HELPERS
@@ -458,7 +455,7 @@ def get_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📊 Мой Дашборд"), KeyboardButton(text="🚀 Следующая статья")],
-            [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="❓ Помощь")]
+            [KeyboardButton(text="ℹ️ Статус (/status)"), KeyboardButton(text="❓ Помощь")]
         ],
         resize_keyboard=True,
         input_field_placeholder="Выбери действие..."
@@ -483,7 +480,6 @@ async def send_long_bot(chat_id: int, text: str, reply_markup=None):
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     
-    # ГАРАНТИРОВАННАЯ РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЯ
     success = register_user_safe(
         message.from_user.id, 
         message.from_user.username, 
@@ -736,12 +732,19 @@ async def cb_generate_next(callback: types.CallbackQuery, state: FSMContext):
     await schedule_task(uid, worker_produce_article, state, idea, idea_id)
 
 async def worker_produce_article(chat_id: int, state: FSMContext, idea: dict, idea_id: int):
-    strat_res = supabase.table("market_strategies").select("tone_of_voice_guide, target_audience_profile").eq("user_id", chat_id).order("created_at", desc=True).limit(1).execute()
-    context = ""
-    if strat_res.data:
-        context = f"Тон: {strat_res.data[0].get('tone_of_voice_guide', '')}\nЦА: {strat_res.data[0].get('target_audience_profile', '')}"
-        
-    writer_prompt = f"""
+    """
+    Производство одной статьи с детализацией процесса и таймаутами.
+    """
+    start_time = time.time()
+    TASK_STATUS[chat_id] = "Generating Article..."
+    
+    try:
+        strat_res = supabase.table("market_strategies").select("tone_of_voice_guide, target_audience_profile").eq("user_id", chat_id).order("created_at", desc=True).limit(1).execute()
+        context = ""
+        if strat_res.data:
+            context = f"Тон: {strat_res.data[0].get('tone_of_voice_guide', '')}\nЦА: {strat_res.data[0].get('target_audience_profile', '')}"
+            
+        writer_prompt = f"""
 Тема: {idea['topic_title']}
 Боль ЦА: {idea['pain_point']}
 Слабость конкурента: {idea['competitor_weakness']}
@@ -749,62 +752,77 @@ async def worker_produce_article(chat_id: int, state: FSMContext, idea: dict, id
 
 Напиши статью для Дзена.
 """
-    full_writer_prompt = f"{writer_prompt}\n\nКОНТЕКСТ СТРАТЕГИИ:\n{context}"
-    
-    dzen_text = await agroq(full_writer_prompt, max_tokens=2600, system=WRITER_DZEN_SYSTEM, timeout=120)
-    
-    if not dzen_text:
-        await bot.send_message(chat_id, "⚠️ Ошибка генерации текста.")
-        return
+        full_writer_prompt = f"{writer_prompt}\n\nКОНТЕКСТ СТРАТЕГИИ:\n{context}"
         
-    titles_prompt = f"Придумай 3 заголовка для этой статьи:\n{dzen_text[:500]}..."
-    titles_res = await agroq(titles_prompt, max_tokens=200, system=TITLE_GEN_SYSTEM, timeout=30)
-    
-    vc_text = await agroq(f"Адаптируй под vc.ru:\n{dzen_text}", max_tokens=2600, system=WRITER_VC_SYSTEM, timeout=120)
-    teaser_tg = await agroq(f"Напиши тизер для TG:\n{dzen_text}", max_tokens=300, system=TEASER_SYSTEM, timeout=30)
-    teaser_max = teaser_tg 
-    
-    img_prompt = await agroq(f"Опиши визуал для статьи: {idea['topic_title']}...", max_tokens=100, system=IMAGE_GEN_SYSTEM, timeout=30)
-    
-    image_url = "https://images.unsplash.com/photo-1518780664697-55e3ad937233?w=1200&h=630&fit=crop" 
-    
-    try:
-        res_insert = supabase.table("published_articles").insert({
-            "idea_id": idea_id,
-            "user_id": chat_id,
-            "dzen_content": dzen_text,
-            "vc_ru_content": vc_text,
-            "telegram_preview": teaser_tg,
-            "max_preview": teaser_max,
-            "main_image_url": image_url,
-            "title_clickbait": titles_res.split('\n')[0] if titles_res else "",
-            "title_expert": titles_res.split('\n')[1] if titles_res and len(titles_res.split('\n'))>1 else "",
-            "title_question": titles_res.split('\n')[2] if titles_res and len(titles_res.split('\n'))>2 else "",
-            "publish_status": "ready",
-            "version_status": "draft",
-            "publication_date": str(datetime.now())
-        }).execute()
+        # Шаг 1: Основной текст
+        await bot.send_message(chat_id, "📝 Этап 1/4: Пишу основной текст для Дзена...", disable_notification=True)
+        dzen_text = await agroq(full_writer_prompt, max_tokens=2600, system=WRITER_DZEN_SYSTEM, timeout=120)
         
-        article_db_id = res_insert.data[0]['id']
+        if not dzen_text:
+            raise Exception("Failed to generate main text")
+            
+        # Шаг 2: Заголовки
+        await bot.send_message(chat_id, "🔖 Этап 2/4: Генерирую варианты заголовков...", disable_notification=True)
+        titles_prompt = f"Придумай 3 заголовка для этой статьи:\n{dzen_text[:500]}..."
+        titles_res = await agroq(titles_prompt, max_tokens=200, system=TITLE_GEN_SYSTEM, timeout=30)
+        
+        # Шаг 3: VC.RU
+        await bot.send_message(chat_id, "📰 Этап 3/4: Адаптирую под VC.RU...", disable_notification=True)
+        vc_text = await agroq(f"Адаптируй под vc.ru:\n{dzen_text}", max_tokens=2600, system=WRITER_VC_SYSTEM, timeout=120)
+        
+        # Шаг 4: Тизеры
+        await bot.send_message(chat_id, "📱 Этап 4/4: Делаю тизеры для Telegram/МАХ...", disable_notification=True)
+        teaser_tg = await agroq(f"Напиши тизер для TG:\n{dzen_text}", max_tokens=300, system=TEASER_SYSTEM, timeout=30)
+        teaser_max = teaser_tg 
+        
+        img_prompt = await agroq(f"Опиши визуал для статьи: {idea['topic_title']}...", max_tokens=100, system=IMAGE_GEN_SYSTEM, timeout=30)
+        
+        image_url = "https://images.unsplash.com/photo-1518780664697-55e3ad937233?w=1200&h=630&fit=crop" 
+        
+        try:
+            res_insert = supabase.table("published_articles").insert({
+                "idea_id": idea_id,
+                "user_id": chat_id,
+                "dzen_content": dzen_text,
+                "vc_ru_content": vc_text,
+                "telegram_preview": teaser_tg,
+                "max_preview": teaser_max,
+                "main_image_url": image_url,
+                "title_clickbait": titles_res.split('\n')[0] if titles_res else "",
+                "title_expert": titles_res.split('\n')[1] if titles_res and len(titles_res.split('\n'))>1 else "",
+                "title_question": titles_res.split('\n')[2] if titles_res and len(titles_res.split('\n'))>2 else "",
+                "publish_status": "ready",
+                "version_status": "draft",
+                "publication_date": str(datetime.now())
+            }).execute()
+            
+            article_db_id = res_insert.data[0]['id']
+            
+        except Exception as e:
+            logger.error(f"Save article error: {e}")
+            raise e
+
+        duration = int(time.time() - start_time)
+        msg = f"✅ **СТАТЬЯ ГОТОВА!** (Заняло {duration} сек.)\n\n"
+        msg += f"📄 **Для Дзена:**\n{dzen_text[:500]}...\n\n"
+        msg += f" **Заголовки:**\n{titles_res}\n\n"
+        msg += f"📱 **Тизер для TG/МАХ:**\n{teaser_tg}\n\n"
+        msg += "Что делать дальше?"
+        
+        kb_art = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Ручная правка", callback_data=f"edit_manual_{article_db_id}")],
+            [InlineKeyboardButton(text="🔄 Перегенерировать", callback_data=f"regen_{article_db_id}")],
+            [InlineKeyboardButton(text="✅ Принять и сохранить", callback_data=f"accept_{article_db_id}")],
+            [InlineKeyboardButton(text="📢 Публиковать в TG", callback_data=f"pub_tg_{article_db_id}")]
+        ])
+        
+        await send_long_bot(chat_id, msg, reply_markup=kb_art)
+        TASK_STATUS[chat_id] = "Done"
         
     except Exception as e:
-        logger.error(f"Save article error: {e}")
-        return
-
-    msg = f"✅ **СТАТЬЯ ГОТОВА!**\n\n"
-    msg += f"📄 **Для Дзена:**\n{dzen_text[:500]}...\n\n"
-    msg += f" **Заголовки:**\n{titles_res}\n\n"
-    msg += f"📱 **Тизер для TG/МАХ:**\n{teaser_tg}\n\n"
-    msg += "Что делать дальше?"
-    
-    kb_art = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Ручная правка", callback_data=f"edit_manual_{article_db_id}")],
-        [InlineKeyboardButton(text="🔄 Перегенерировать", callback_data=f"regen_{article_db_id}")],
-        [InlineKeyboardButton(text="✅ Принять и сохранить", callback_data=f"accept_{article_db_id}")],
-        [InlineKeyboardButton(text="📢 Публиковать в TG", callback_data=f"pub_tg_{article_db_id}")]
-    ])
-    
-    await send_long_bot(chat_id, msg, reply_markup=kb_art)
+        logger.exception(f"❌ Worker produce article error for {chat_id}: {e}")
+        await bot.send_message(chat_id, f"⚠️ Ошибка при генерации статьи: {str(e)[:100]}\nПопробуй снова через минуту.", reply_markup=get_menu())
+        TASK_STATUS[chat_id] = f"Error: {str(e)[:50]}"
 
 # =========================
 # EDITING & REGENERATION LOGIC
@@ -966,13 +984,24 @@ async def cmd_help(message: types.Message):
     )
 
 @dp.message(Command("status"))
+@dp.message(F.text == "ℹ️ Статус (/status)")
 async def cmd_status(message: types.Message, state: FSMContext):
     uid = message.from_user.id
-    try:
-        ideas_left = supabase.table("article_ideas_queue").select("*").eq("is_processed", False).count().execute() 
-        await message.answer(f"🟢 Агент активен.\nОсталось идей в очереди: ~{ideas_left.count if ideas_left.count else 0}")
-    except:
-        await message.answer("🟢 Агент активен.")
+    current_state = await state.get_state()
+    task_status = TASK_STATUS.get(uid, "Idle")
+    is_busy = uid in ACTIVE_TASKS and not ACTIVE_TASKS[uid].done()
+    
+    status_msg = f"🧠 **Статус агента:**\n\n"
+    status_msg += f"🔹 **FSM Состояние:** `{current_state or 'None'}`\n"
+    status_msg += f"🔹 **Фоновая задача:** {'🟢 РАБОТАЕТ' if is_busy else '⚪ СВОБОДНА'}\n"
+    status_msg += f"🔹 **Текущий этап:** `{task_status}`\n"
+    
+    if is_busy:
+        status_msg += "\n⏳ Подожди завершения операции. Максимум 5 минут."
+    else:
+        status_msg += "\n✅ Можно продолжать работу."
+        
+    await message.answer(status_msg, reply_markup=get_menu())
 
 @dp.callback_query(F.data == "setup_channels")
 async def cb_setup_channels(callback: types.CallbackQuery, state: FSMContext):
@@ -1051,19 +1080,14 @@ def heartbeat():
 async def main():
     logger.info("🚀 Starting AUTONOMOUS AGENT V5...")
     
-    # 1. Удаляем вебхук и сбрасываем обновления
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
         logger.warning(f"⚠️ delete_webhook error: {e}")
     
-    # 2. ПАУЗА ДЛЯ ИЗБЕЖАНИЯ КОНФЛИКТА BOT INSTANCES
-    # Render может быстро перезапускать сервис. Старый процесс умирает,
-    # но Telegram еще держит соединение. Ждем 10 секунд, чтобы гарантировать чистый старт.
     logger.info("⏳ Waiting 10 seconds to avoid Telegram conflict...")
     await asyncio.sleep(10)
     
-    # 3. Запускаем polling
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
 if __name__ == "__main__":
