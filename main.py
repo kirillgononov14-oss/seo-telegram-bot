@@ -20,7 +20,12 @@ from aiogram.types import (
 )
 from supabase import create_client, Client
 from bs4 import BeautifulSoup
-from duckduckgo_search import DDGS
+# Используем современный импорт для DuckDuckGo
+try:
+    from ddgs import DDGS
+except ImportError:
+    from duckduckgo_search import DDGS # Фолбэк на старое имя, если новое не установлено
+
 from typing import Callable, Dict, Any, Optional, List
 
 # =========================
@@ -60,30 +65,29 @@ DAILY_LIMIT = 3
 def register_user_safe(user_id: int, username: str = "", first_name: str = "") -> bool:
     """
     Гарантированно регистрирует пользователя.
-    Использует upsert, чтобы не упасть, если пользователь уже есть.
+    После отключения RLS эта операция должна проходить успешно.
     """
     try:
-        # Пытаемся вставить или обновить запись
         data = {
             "id": user_id,
             "username": username or "",
             "first_name": first_name or ""
         }
         
-        # Supabase Python SDK .upsert() требует уникального ключа (primary key)
-        # Для таблицы users PK это id.
+        # Upsert: если есть - обновляет, если нет - создает
         res = supabase.table("users").upsert(data).execute()
         
         if res.data:
             logger.info(f"🆕 User registered/updated: {user_id}")
             return True
         else:
-            logger.warning(f"⚠️ Upsert returned no data for user {user_id}")
-            # Проверяем вручную
+            # Если upsert вернул пусто, проверяем вручную
             check = supabase.table("users").select("*").eq("id", user_id).execute()
             if check.data:
+                logger.info(f"✅ User already exists: {user_id}")
                 return True
             
+        logger.warning(f"⚠️ Upsert returned no data for user {user_id}")
         return False
         
     except Exception as e:
@@ -316,7 +320,7 @@ async def schedule_task(uid: int, func: Callable, *args, **kwargs):
     ACTIVE_TASKS[uid] = task
 
 async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_data: dict):
-    # 1. Проверка наличия пользователя (гарантия от /start)
+    # 1. Проверка наличия пользователя
     user_check = supabase.table("users").select("id").eq("id", chat_id).execute()
     if not user_check.data:
         logger.error(f"❌ USER MISSING IN DB during spy work: {chat_id}")
@@ -474,7 +478,7 @@ async def send_long_bot(chat_id: int, text: str, reply_markup=None):
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     
-    # ГАРАНТИРОВАННАЯ РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЯ ПЕРЕД ЛЮБЫМИ ДЕЙСТВИЯМИ
+    # ГАРАНТИРОВАННАЯ РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЯ
     success = register_user_safe(
         message.from_user.id, 
         message.from_user.username, 
