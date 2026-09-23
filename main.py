@@ -212,7 +212,7 @@ async def run_sync(func: Callable, *args, timeout: int = 30, default: Any = None
         return default
 
 # =========================
-# PARSING & SPYING ENGINE
+# PARSING & SPYING ENGINE WITH REPORTING
 # =========================
 
 def scrape_with_api(url: str, premium: bool = False, render: bool = False) -> Optional[str]:
@@ -241,19 +241,29 @@ def detect_source_type(url: str) -> str:
     if "instagram" in u: return "instagram"
     return "site"
 
-def parse_generic_site(url: str) -> Optional[str]:
+def parse_generic_site(url: str) -> tuple[Optional[str], str]:
+    """
+    Возвращает (текст, статус_сообщение)
+    """
     html = scrape_with_api(url, premium=False, render=True)
-    if not html: return None
+    if not html:
+        return None, "⚠️ Не удалось открыть сайт (таймаут или блокировка)."
     
     soup = BeautifulSoup(html, "lxml")
     for s in soup(["script", "style", "nav", "footer", "header", "noscript"]):
         s.decompose()
     
     main_content = soup.find("main") or soup.find("article") or soup.body
-    if not main_content: return None
+    if not main_content:
+        return None, "⚠️ Сайт открылся, но основной контент не найден."
     
     text = main_content.get_text(separator="\n", strip=True)
-    return text[:4000] if len(text) > 100 else None
+    length = len(text)
+    
+    if length < 100:
+        return text, f"ℹ️ Сайт открыт, но текста очень мало ({length} зн.). Возможно, JS-рендеринг."
+        
+    return text[:4000], f"✅ Сайт изучен ({length} зн. контента)."
 
 def find_competitors(niche_query: str, top_n: int = 5) -> List[Dict]:
     competitors = []
@@ -273,7 +283,7 @@ def find_competitors(niche_query: str, top_n: int = 5) -> List[Dict]:
 def analyze_competitor_data(client_data: str, competitor_list: List[Dict]) -> str:
     comp_texts = []
     for i, comp in enumerate(competitor_list[:3]):
-        site_text = parse_generic_site(comp['url'])
+        site_text = parse_generic_site(comp['url'])[0]
         if site_text:
             comp_texts.append(f"КОНКУРЕНТ {i+1} ({comp['title']}):\n{site_text[:1500]}")
         else:
@@ -303,7 +313,7 @@ class OnboardingStates(StatesGroup):
 # =========================
 
 ACTIVE_TASKS: Dict[int, asyncio.Task] = {}
-TASK_STATUS: Dict[int, str] = {} # Для отслеживания статуса
+TASK_STATUS: Dict[int, str] = {} 
 
 async def cancel_task(uid: int):
     task = ACTIVE_TASKS.pop(uid, None)
@@ -331,26 +341,48 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
     await bot.send_message(chat_id, "🕵️♂️ **Запускаю глубокий шпионаж...**\nИзучаю конкурентов, анализирую боли ЦА и формирую стратегию.\nЭто займет 2-3 минуты.", disable_notification=True)
     
     client_raw_data = ""
+    parsing_report_lines = [] # Собираем отчет
+    
     if mode == "pilot":
         links = input_data.get("links", [])
         for link in links:
             stype = detect_source_type(link)
+            status_msg = ""
+            content = ""
+            
             if stype == "site":
-                txt = parse_generic_site(link)
-                if txt: client_raw_data += f"\n=== SITE: {link} ===\n{txt}\n"
+                content, status_msg = parse_generic_site(link)
+                if content:
+                    client_raw_data += f"\n=== SITE: {link} ===\n{content}\n"
+                parsing_report_lines.append(f"🌐 Сайт: {status_msg}")
+                
             elif stype == "avito":
                 txt = scrape_with_api(link, premium=True, render=True)
                 if txt:
                      soup = BeautifulSoup(txt, "lxml")
                      clean = soup.get_text(separator="\n", strip=True)[:2000]
-                     client_raw_data += f"\n=== AVITO: {link} ===\n{clean}\n"
+                     if len(clean) > 100:
+                         client_raw_data += f"\n=== AVITO: {link} ===\n{clean}\n"
+                         parsing_report_lines.append(f"✈️ Авито: ✅ Объявление прочитано ({len(clean)} зн.)")
+                     else:
+                         parsing_report_lines.append(f"✈️ Авито: ⚠️ Мало данных ({len(clean)} зн.), возможно закрытое объявление.")
+                else:
+                    parsing_report_lines.append(f"✈️ Авито: ❌ Не удалось открыть страницу.")
+                    
             elif stype == "vk":
                  vk_url = link.replace("vk.com", "m.vk.com").replace("vk.ru", "m.vk.com")
                  txt = scrape_with_api(vk_url, premium=True, render=True)
                  if txt:
                      soup = BeautifulSoup(txt, "lxml")
                      clean = soup.get_text(separator="\n", strip=True)[:2000]
-                     client_raw_data += f"\n=== VK: {link} ===\n{clean}\n"
+                     if len(clean) > 100:
+                         client_raw_data += f"\n=== VK: {link} ===\n{clean}\n"
+                         parsing_report_lines.append(f"💬 ВК: ✅ Группа изучена ({len(clean)} зн.)")
+                     else:
+                         parsing_report_lines.append(f"💬 ВК: ⚠️ Открылась заглушка или вход. Данные минимальны.")
+                 else:
+                    parsing_report_lines.append(f"💬 ВК: ❌ Блокировка или ошибка сети.")
+                    
             elif stype == "telegram":
                  ch = link.split("/")[-1]
                  pub_link = f"https://t.me/s/{ch}"
@@ -358,10 +390,23 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
                  if txt:
                      soup = BeautifulSoup(txt, "lxml")
                      posts = [p.get_text(strip=True) for p in soup.find_all("div", class_="tgme_widget_message_text")]
-                     client_raw_data += f"\n=== TELEGRAM: {link} ===\n" + "\n".join(posts[:5])[:2000] + "\n"
+                     joined_posts = "\n".join(posts[:5])
+                     if len(joined_posts) > 50:
+                         client_raw_data += f"\n=== TELEGRAM: {link} ===\n{joined_posts[:2000]}\n"
+                         parsing_report_lines.append(f"📢 TG: ✅ Канал прочитан ({len(joined_posts)} зн.)")
+                     else:
+                         parsing_report_lines.append(f"📢 TG: ️ Публичная версия недоступна или канал пуст.")
+                 else:
+                    parsing_report_lines.append(f"📢 TG: ❌ Не удалось получить доступ к t.me/s/")
+                    
             elif stype == "max":
-                 pass 
+                 parsing_report_lines.append(f"📱 МАХ: ℹ️ Автоматический парсинг МАХ пока ограничен API. Буду использовать общие знания ниши.") 
     
+    # Отправляем отчет пользователю ПЕРЕД началом анализа LLM
+    if parsing_report_lines:
+        report_text = "📊 **Отчет по твоим источникам:**\n\n" + "\n".join(parsing_report_lines)
+        await bot.send_message(chat_id, report_text, disable_notification=True)
+
     if not client_raw_data:
         client_raw_data = input_data.get("description", "Нет данных с сайтов.")
 
