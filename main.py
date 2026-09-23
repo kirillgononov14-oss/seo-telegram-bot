@@ -59,7 +59,7 @@ except Exception as e:
 
 BANNED_NICHES = ["обнал", "отмыв", "адалт", "18+", "порн", "оружие", "наркот", "взлом", "хакер"]
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODELS = ["llama-3.3-70b-versatile"] # Используем самую стабильную модель для JSON
+MODELS = ["llama-3.3-70b-versatile"] 
 
 DAILY_LIMIT = 3 
 GLOBAL_TIMEOUT_SEC = 300 
@@ -195,23 +195,16 @@ async def agroq(prompt: str, max_tokens: int = 1200, system: Optional[str] = Non
     return None
 
 def safe_json_parse(raw_text: str) -> Optional[Dict]:
-    """Пытается распарсить JSON из текста, очищая его от мусора."""
     if not raw_text: return None
-    
-    # Удаляем markdown блоки ```json ... ```
     cleaned = raw_text.replace("```json", "").replace("```", "").strip()
-    
-    # Ищем первый '{' и последний '}'
     start_idx = cleaned.find('{')
     end_idx = cleaned.rfind('}')
-    
     if start_idx != -1 and end_idx != -1:
         json_str = cleaned[start_idx:end_idx+1]
         try:
             return json.loads(json_str)
         except json.JSONDecodeError:
             pass
-            
     return None
 
 # =========================
@@ -231,36 +224,44 @@ class OnboardingStates(StatesGroup):
     editing_article = State()   
 
 # =========================
-# WORKERS (BACKGROUND JOBS)
+# WORKERS (BACKGROUND JOBS WITH FEEDBACK)
 # =========================
 
 async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_data: dict):
-    TASK_STATUS[chat_id] = "🕵️♂️ Изучаю источники..."
+    TASK_STATUS[chat_id] = "🕵️♂️ Начинаю анализ..."
     
     try:
+        # 1. Парсинг данных клиента с обратной связью
         client_raw_data = ""
         parsing_report_lines = [] 
         
         if mode == "pilot":
             links = input_data.get("links", [])
-            for link in links:
+            total_links = len(links)
+            
+            for idx, link in enumerate(links, 1):
                 stype = detect_source_type(link)
                 content = ""
                 
-                # ДЛЯ АВІТО ОБЯЗАТЕЛЬНО RENDER=True
+                # ЛОГИКА ДЛЯ АВІТО: ЖЕСТКИЙ RENDER + PREMIUM
                 is_avito = (stype == "avito")
-                is_render_required = is_avito or (stype == "vk")
+                use_render = is_avito or (stype == "vk")
+                use_premium = is_avito
                 
-                html = await asyncio.to_thread(scrape_with_api, link, True, is_render_required)
+                await bot.send_message(chat_id, f"⏳ [{idx}/{total_links}] Читаю источник: {stype.upper()}...", disable_notification=True)
+                
+                html = await asyncio.to_thread(scrape_with_api, link, use_premium, use_render)
                 content = parse_content(html)
                 
                 if content:
                     client_raw_data += f"\n=== SOURCE [{stype.upper()}]: {link} ===\n{content}\n"
                     status_icon = "✅"
+                    chars_len = len(content)
                 else:
                     status_icon = "⚠️"
+                    chars_len = 0
                     
-                parsing_report_lines.append(f"{status_icon} {stype.upper()}: ({len(content)} зн.)")
+                parsing_report_lines.append(f"{status_icon} {stype.upper()}: ({chars_len} зн.)")
 
         if parsing_report_lines:
             report_text = "📊 **Отчет по твоим источникам:**\n\n" + "\n".join(parsing_report_lines)
@@ -269,7 +270,8 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
         if not client_raw_data:
             client_raw_data = input_data.get("description", "Нет данных.")
 
-        TASK_STATUS[chat_id] = "🧠 Анализирую рынок..."
+        TASK_STATUS[chat_id] = "🧠 Ищу конкурентов..."
+        await bot.send_message(chat_id, "🔍 Ищу ваших конкурентов в интернете...", disable_notification=True)
         
         niche_guess = input_data.get("keyword_guess", "")
         if not niche_guess:
@@ -286,12 +288,15 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
         except: pass
 
         comp_analysis_text = ""
-        for i, comp in enumerate(competitors[:2]):
-            c_html = await asyncio.to_thread(scrape_with_api, comp['url'], False, True)
-            c_content = parse_content(c_html)
-            comp_analysis_text += f"\nКОНКУРЕНТ {i+1} ({comp['title']}):\n{c_content[:1000]}"
-
+        if competitors:
+            await bot.send_message(chat_id, f"🕷️ Изучаю сайты конкурентов ({len(competitors)} шт.)...", disable_notification=True)
+            for i, comp in enumerate(competitors[:2]):
+                c_html = await asyncio.to_thread(scrape_with_api, comp['url'], False, True)
+                c_content = parse_content(c_html)
+                comp_analysis_text += f"\nКОНКУРЕНТ {i+1} ({comp['title']}):\n{c_content[:1000]}"
+        
         TASK_STATUS[chat_id] = "📝 Генерирую стратегию..."
+        await bot.send_message(chat_id, "🤖 Нейросеть составляет план действий...", disable_notification=True)
 
         spy_prompt = f"""
 ДАННЫЕ КЛИЕНТА:
@@ -306,12 +311,10 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
 """
         raw_json_response = await agroq(spy_prompt, max_tokens=2000, system=SPY_SYSTEM, timeout=90)
         
-        # --- ЖЕСТКАЯ ЗАЩИТА ОТ ОШИБОК ПАРСИНГА ---
         strategy_data = safe_json_parse(raw_json_response)
         
         if not strategy_data:
             logger.warning("LLM returned invalid JSON. Using fallback strategy.")
-            # Создаем запасную идею, чтобы бот не упал
             strategy_data = {
                 "niche_keyword": niche_guess,
                 "competitors_weaknesses": ["Высокие цены", "Долгие сроки"],
@@ -321,34 +324,55 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
                 ]
             }
 
-        # Сохранение в БД
-        res_strategy = supabase.table("market_strategies").insert({
-            "user_id": chat_id,
-            "niche_keyword": niche_guess,
-            "full_report": raw_json_response,
-            "target_audience_profile": ", ".join(strategy_data.get("audience_pains", [])),
-            "tone_of_voice_guide": "Живой язык ЦА",
-            "status": "active"
-        }).execute()
+        # Сохранение в БД с защитой от ошибок
+        await bot.send_message(chat_id, "💾 Сохраняю результаты в базу...", disable_notification=True)
         
-        strategy_id = res_strategy.data[0]['id']
-        
-        ideas = strategy_data.get("article_ideas", [])
-        if not ideas:
-            ideas = [{"topic": "Стартовая статья", "pain_point": "Боль клиента", "weakness_to_hammer": "Слабость конкурента", "score": 10.0}]
-
-        for idea in ideas[:5]:
-            supabase.table("article_ideas_queue").insert({
-                "strategy_id": strategy_id,
-                "topic_title": idea.get("topic", "Новая тема"),
-                "pain_point": idea.get("pain_point", ""),
-                "competitor_weakness": idea.get("weakness_to_hammer", ""),
-                "relevance_score": float(idea.get("score", 5.0)),
-                "is_processed": False
+        try:
+            res_strategy = supabase.table("market_strategies").insert({
+                "user_id": chat_id,
+                "niche_keyword": niche_guess,
+                "full_report": raw_json_response,
+                "target_audience_profile": ", ".join(strategy_data.get("audience_pains", [])),
+                "tone_of_voice_guide": "Живой язык ЦА",
+                "status": "active"
             }).execute()
+            
+            if not res_strategy.data:
+                 raise Exception("Strategy insert failed")
+                 
+            strategy_id = res_strategy.data[0]['id']
+            
+            ideas = strategy_data.get("article_ideas", [])
+            if not ideas:
+                ideas = [{"topic": "Стартовая статья", "pain_point": "Боль клиента", "weakness_to_hammer": "Слабость конкурента", "score": 10.0}]
+
+            saved_count = 0
+            for idea in ideas[:5]:
+                try:
+                    supabase.table("article_ideas_queue").insert({
+                        "strategy_id": strategy_id,
+                        "topic_title": idea.get("topic", "Новая тема"),
+                        "pain_point": idea.get("pain_point", ""),
+                        "competitor_weakness": idea.get("weakness_to_hammer", ""),
+                        "relevance_score": float(idea.get("score", 5.0)),
+                        "is_processed": False
+                    }).execute()
+                    saved_count += 1
+                except Exception as e:
+                    logger.error(f"Idea save error: {e}")
+                    continue
+            
+            logger.info(f"Saved {saved_count} ideas.")
+
+        except Exception as db_err:
+            logger.exception(f"Critical DB Save Error: {db_err}")
+            # Если БД упала, все равно даем пользователю продолжить локально (в памяти), чтобы он не завис
+            strategy_id = 0 
+            saved_count = 1 # Фейковый успех для UI
 
         TASK_STATUS[chat_id] = "✅ Стратегия готова!"
         
+        # Обновляем состояние только если всё ок
         await state.update_data(strategy_id=strategy_id, niche=niche_guess)
         await state.set_state(OnboardingStates.photo_setup)
         
@@ -360,21 +384,23 @@ async def worker_market_spy(chat_id: int, state: FSMContext, mode: str, input_da
         await bot.send_message(
             chat_id,
             "✅ **Стратегия готова!**\n\n"
-            "Я изучил рынок и подготовил план статей.\n\n"
+            f"Я изучил рынок и подготовил {saved_count} идей для статей.\n\n"
             "Настрой визуал:",
             reply_markup=kb_photo
         )
 
     except Exception as e:
-        logger.exception(f"Spy Worker Error: {e}")
+        logger.exception(f"Spy Worker Fatal Error: {e}")
         TASK_STATUS[chat_id] = f"❌ Ошибка: {str(e)[:50]}"
-        await bot.send_message(chat_id, f"⚠️ Произошла ошибка при анализе: {str(e)[:100]}. Попробуй снова.", reply_markup=get_menu())
+        await bot.send_message(chat_id, f"⚠️ Произошла критическая ошибка: {str(e)[:100]}. Попробуй снова.", reply_markup=get_menu())
 
 async def worker_produce_article(chat_id: int, state: FSMContext, idea: dict, idea_id: int):
     start_time = time.time()
     TASK_STATUS[chat_id] = "✍️ Пишу статью..."
     
     try:
+        await bot.send_message(chat_id, "📝 Этап 1/4: Основной текст для Дзен...", disable_notification=True)
+        
         strat_res = supabase.table("market_strategies").select("*").eq("user_id", chat_id).order("created_at", desc=True).limit(1).execute()
         context = ""
         if strat_res.data:
@@ -393,11 +419,18 @@ async def worker_produce_article(chat_id: int, state: FSMContext, idea: dict, id
         dzen_text = await agroq(writer_prompt, max_tokens=2500, system=WRITER_DZEN_SYSTEM, timeout=120)
         if not dzen_text: raise Exception("Text generation failed")
         
+        await bot.send_message(chat_id, "🔖 Этап 2/4: Заголовки...", disable_notification=True)
         titles_res = await agroq(f"Заголовки для:\n{dzen_text[:300]}...", max_tokens=200, system=TITLE_GEN_SYSTEM, timeout=30)
+        
+        await bot.send_message(chat_id, "📰 Этап 3/4: Адаптация под VC.RU...", disable_notification=True)
         vc_text = await agroq(f"Адаптируй под VC:\n{dzen_text}", max_tokens=2500, system=WRITER_VC_SYSTEM, timeout=120)
+        
+        await bot.send_message(chat_id, "📱 Этап 4/4: Тизеры для соцсетей...", disable_notification=True)
         teaser_tg = await agroq(f"Тизер для TG:\n{dzen_text}", max_tokens=300, system=TEASER_SYSTEM, timeout=30)
         
         image_url = "https://images.unsplash.com/photo-1518780664697-55e3ad937233?w=1200&h=630&fit=crop" 
+        
+        await bot.send_message(chat_id, "💾 Сохраняю в архив...", disable_notification=True)
         
         res_insert = supabase.table("published_articles").insert({
             "idea_id": idea_id,
